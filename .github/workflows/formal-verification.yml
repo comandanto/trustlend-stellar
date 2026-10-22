@@ -38,6 +38,7 @@ jobs:
   kani-verify:
     name: Kani Model Checking
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -57,6 +58,9 @@ jobs:
         working-directory: ./contracts/lending
         run: |
           for proof_file in kani_proofs/*.rs; do
+            if [ "$proof_file" = "kani_proofs/mod.rs" ]; then
+              continue
+            fi
             echo "=== Verifying $proof_file ==="
             kani "$proof_file"
           done
