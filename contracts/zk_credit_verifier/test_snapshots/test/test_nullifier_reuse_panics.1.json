@@ -22,7 +22,7 @@
                   "string": "PolygonID-Experian"
                 },
                 {
-                  "bytes": "0202020202020202020202020202020202020202020202020202020202020202"
+                  "bytes": "6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827"
                 }
               ]
             }
@@ -31,6 +31,7 @@
         }
       ]
     ],
+    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
@@ -74,7 +75,7 @@
                         "symbol": "proof_bytes"
                       },
                       "val": {
-                        "bytes": "00000000000000000000ff0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                        "bytes": "7da04aa8e8a6958ef926c7575b6ff2a3d1c555a8406266313cd4fa5d42dc12170f3c70af3d004a94e3732594b81a9215ce7734c7d5846261c56dc1795ff47806"
                       }
                     },
                     {
@@ -83,6 +84,14 @@
                       },
                       "val": {
                         "string": "PolygonID-Experian"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "provider_public_key"
+                      },
+                      "val": {
+                        "bytes": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
                       }
                     },
                     {
@@ -300,7 +309,7 @@
                           ]
                         },
                         "val": {
-                          "bytes": "0202020202020202020202020202020202020202020202020202020202020202"
+                          "bytes": "6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827"
                         }
                       },
                       {

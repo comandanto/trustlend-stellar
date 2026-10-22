@@ -89,7 +89,7 @@ const I128_MAX: i128 = i128::MAX;
 /// Basic happy-path: loan request created with correct totals.
 #[test]
 fn test_create_loan_request_basic() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     // 1 000 XLM at 10 % for 30 days
@@ -134,7 +134,7 @@ fn test_create_loan_request_basic() {
 #[test]
 #[should_panic(expected = "Interest rate is below the protocol minimum")]
 fn test_create_loan_request_rejects_rate_below_protocol_minimum() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     client.create_loan_request(
@@ -157,7 +157,7 @@ fn test_create_loan_request_rejects_rate_below_protocol_minimum() {
 /// Verify the interest formula numerically for a known input.
 #[test]
 fn test_interest_calculation_is_correct() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     // 10 000 XLM at 15 % for 365 days → full annual interest = 10_000 * 15 % = 1 500 XLM
@@ -193,7 +193,7 @@ fn test_interest_calculation_is_correct() {
 /// Maximum allowed duration (365 days) must succeed.
 #[test]
 fn test_create_loan_max_duration_365_days() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     let principal: i128 = 500_0000000; // 500 XLM
@@ -227,7 +227,7 @@ fn test_create_loan_max_duration_365_days() {
 /// A loan with duration 1 day (minimum) must succeed.
 #[test]
 fn test_create_loan_min_duration_1_day() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     let loan_id = client.create_loan_request(
@@ -330,7 +330,7 @@ fn test_overflow_panics_at_second_multiplication() {
 #[test]
 #[should_panic(expected = "Amount exceeds reputation-based limit")]
 fn test_near_max_principal_rejected_by_on_chain_limit() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     client.create_loan_request(
@@ -359,7 +359,7 @@ fn test_near_max_principal_rejected_by_on_chain_limit() {
 #[test]
 #[should_panic(expected = "Duration must be between 1 and 365 days")]
 fn test_duration_zero_is_rejected() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     client.create_loan_request(
@@ -386,7 +386,7 @@ fn test_duration_zero_is_rejected() {
 #[test]
 #[should_panic(expected = "Duration must be between 1 and 365 days")]
 fn test_duration_366_is_rejected() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     client.create_loan_request(
@@ -413,7 +413,7 @@ fn test_duration_366_is_rejected() {
 #[test]
 #[should_panic(expected = "Loan amount must be positive")]
 fn test_zero_amount_is_rejected() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     client.create_loan_request(
@@ -440,7 +440,7 @@ fn test_zero_amount_is_rejected() {
 #[test]
 #[should_panic(expected = "Loan amount below minimum borrow threshold")]
 fn test_dust_loan_below_min_borrow_amount_is_rejected() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     // 1 stroop (0.0000001 XLM) dust loan attempt
@@ -467,7 +467,7 @@ fn test_dust_loan_below_min_borrow_amount_is_rejected() {
 /// Boundary check: Loan amount exactly at MIN_BORROW_AMOUNT (10_000_000 stroops = 1 XLM) is accepted.
 #[test]
 fn test_min_borrow_amount_boundary_accepted() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     let loan_id = client.create_loan_request(
@@ -581,10 +581,11 @@ fn test_non_whitelisted_collateral_asset_rejected() {
 /// For 365 days the offset is 365 * 86_400 = 31_536_000 seconds.
 #[test]
 fn test_due_at_computed_correctly() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     env.ledger().set_timestamp(1_000_000_000_u64);
+    client.set_asset_oracle_prices(&admin, &collateral_asset, &vec![&env, PRICE_PRECISION]);
 
     let days: u32 = 365;
     let loan_id = client.create_loan_request(
@@ -616,7 +617,7 @@ fn test_due_at_computed_correctly() {
 /// Platform fee must equal exactly 1 % of interest.
 #[test]
 fn test_platform_fee_is_one_percent_of_interest() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     let principal: i128 = 10_000_0000000; // 10 000 XLM
@@ -735,6 +736,16 @@ fn setup_with_multisig() -> (Env, Address, Address, Address, Address, Address, A
 
     let collateral_asset = Address::generate(&env);
     client.whitelist_asset(&admin, &collateral_asset);
+    client.set_asset_collateral_config(
+        &admin,
+        &collateral_asset,
+        &AssetCollateralConfig {
+            collateral_factor_bps: DEFAULT_COLLATERAL_FACTOR_BPS,
+            has_price_oracle: true,
+            volatility_bps: 0,
+        },
+    );
+    client.set_asset_oracle_prices(&admin, &collateral_asset, &vec![&env, PRICE_PRECISION]);
 
     link_reputation(&env, &client, &admin, &borrower);
 
@@ -1117,7 +1128,7 @@ fn create_and_activate_loan(
 /// Creating a Fixed-rate loan stores the model correctly.
 #[test]
 fn test_create_loan_with_fixed_rate_model() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     let loan_id = client.create_loan_request(
@@ -1141,7 +1152,7 @@ fn test_create_loan_with_fixed_rate_model() {
 /// Creating a Floating-rate loan stores the model correctly.
 #[test]
 fn test_create_loan_with_floating_rate_model() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     let loan_id = client.create_loan_request(
@@ -1198,6 +1209,7 @@ fn test_switch_rate_model_cooldown_enforced() {
     let client = LendingContractClient::new(&env, &contract_id);
 
     env.ledger().set_timestamp(1_000_000_000);
+    client.set_asset_oracle_prices(&admin, &collateral_asset, &vec![&env, PRICE_PRECISION]);
 
     let loan_id = create_and_activate_loan(
         &env,
@@ -1221,6 +1233,7 @@ fn test_switch_rate_model_allowed_after_cooldown() {
     let client = LendingContractClient::new(&env, &contract_id);
 
     env.ledger().set_timestamp(1_000_000_000);
+    client.set_asset_oracle_prices(&admin, &collateral_asset, &vec![&env, PRICE_PRECISION]);
 
     let loan_id = create_and_activate_loan(
         &env,
@@ -1267,7 +1280,7 @@ fn test_switch_rate_model_only_borrower() {
 #[test]
 #[should_panic(expected = "Can only switch rate model on ACTIVE loans")]
 fn test_switch_rate_model_only_active() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
     let loan_id = client.create_loan_request(
@@ -2157,12 +2170,15 @@ fn test_price_oracle_median_resists_manipulation() {
 /// TWAP is used when live oracle samples are unavailable.
 #[test]
 fn test_price_oracle_twap_fallback_is_used() {
-    let (env, contract_id, admin, borrower, asset_a, _asset_b) = setup_multi_collateral();
+    let (env, contract_id, admin, borrower, _asset_a, _asset_b) = setup_multi_collateral();
     let client = LendingContractClient::new(&env, &contract_id);
 
+    let asset_twap_admin = Address::generate(&env);
+    let asset_twap = env.register_stellar_asset_contract_v2(asset_twap_admin).address();
+    client.whitelist_asset(&admin, &asset_twap);
     client.set_asset_collateral_config(
         &admin,
-        &asset_a,
+        &asset_twap,
         &AssetCollateralConfig {
             collateral_factor_bps: 7500,
             has_price_oracle: true,
@@ -2170,8 +2186,9 @@ fn test_price_oracle_twap_fallback_is_used() {
         },
     );
 
-    client.deposit_collateral(&borrower, &asset_a, &1_000_0000000);
-    client.set_asset_twap_price(&admin, &asset_a, &(PRICE_PRECISION * 2));
+    token::StellarAssetClient::new(&env, &asset_twap).mint(&borrower, &1_000_000_000_000_000i128);
+    client.deposit_collateral(&borrower, &asset_twap, &1_000_0000000);
+    client.set_asset_twap_price(&admin, &asset_twap, &(PRICE_PRECISION * 2));
 
     let value = client.get_total_collateral_value(&borrower);
     assert_eq!(value, 2_000_0000000);
@@ -2421,6 +2438,16 @@ fn test_repayment_calls_loyalty_contract() {
     client.initialize(&admin);
     client.set_multisig_admin(&admin, &admin);
     client.whitelist_asset(&admin, &collateral_asset);
+    client.set_asset_collateral_config(
+        &admin,
+        &collateral_asset,
+        &AssetCollateralConfig {
+            collateral_factor_bps: DEFAULT_COLLATERAL_FACTOR_BPS,
+            has_price_oracle: true,
+            volatility_bps: 0,
+        },
+    );
+    client.set_asset_oracle_prices(&admin, &collateral_asset, &vec![&env, PRICE_PRECISION]);
 
     // Register and initialise loyalty contract
     let token_id = env
@@ -2518,6 +2545,16 @@ fn test_late_repayment_no_reward() {
     client.initialize(&admin);
     client.set_multisig_admin(&admin, &admin);
     client.whitelist_asset(&admin, &collateral_asset);
+    client.set_asset_collateral_config(
+        &admin,
+        &collateral_asset,
+        &AssetCollateralConfig {
+            collateral_factor_bps: DEFAULT_COLLATERAL_FACTOR_BPS,
+            has_price_oracle: true,
+            volatility_bps: 0,
+        },
+    );
+    client.set_asset_oracle_prices(&admin, &collateral_asset, &vec![&env, PRICE_PRECISION]);
 
     // Register and initialise loyalty contract
     let token_id = env
@@ -2608,6 +2645,16 @@ fn setup_with_referral() -> (Env, Address, Address, Address, Address, Address, A
     client.initialize(&admin);
     client.set_multisig_admin(&admin, &admin);
     client.whitelist_asset(&admin, &collateral_asset);
+    client.set_asset_collateral_config(
+        &admin,
+        &collateral_asset,
+        &AssetCollateralConfig {
+            collateral_factor_bps: DEFAULT_COLLATERAL_FACTOR_BPS,
+            has_price_oracle: true,
+            volatility_bps: 0,
+        },
+    );
+    client.set_asset_oracle_prices(&admin, &collateral_asset, &vec![&env, PRICE_PRECISION]);
 
     let token_id = env
         .register_stellar_asset_contract_v2(admin.clone())
@@ -2818,6 +2865,16 @@ fn test_activation_succeeds_when_referral_pool_is_empty() {
     client.initialize(&admin);
     client.set_multisig_admin(&admin, &admin);
     client.whitelist_asset(&admin, &collateral_asset);
+    client.set_asset_collateral_config(
+        &admin,
+        &collateral_asset,
+        &AssetCollateralConfig {
+            collateral_factor_bps: DEFAULT_COLLATERAL_FACTOR_BPS,
+            has_price_oracle: true,
+            volatility_bps: 0,
+        },
+    );
+    client.set_asset_oracle_prices(&admin, &collateral_asset, &vec![&env, PRICE_PRECISION]);
 
     let token_id = env
         .register_stellar_asset_contract_v2(admin.clone())

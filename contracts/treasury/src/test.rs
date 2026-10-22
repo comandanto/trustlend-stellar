@@ -4,7 +4,7 @@ use super::*;
 use soroban_sdk::{testutils::Address as _, token, vec, Address, Env};
 
 use lending::{
-    CollateralEntry, InterestRateModel, LendingContract, LendingContractClient, LoanRequestInput,
+    AssetCollateralConfig, CollateralEntry, InterestRateModel, LendingContract, LendingContractClient, LoanRequestInput,
 };
 
 fn setup_test() -> (
@@ -165,6 +165,16 @@ fn setup_lending_with_fees(
     let borrower = Address::generate(env);
     let collateral_asset = Address::generate(env);
     lending.whitelist_asset(admin, &collateral_asset);
+    lending.set_asset_collateral_config(
+        admin,
+        &collateral_asset,
+        &AssetCollateralConfig {
+            collateral_factor_bps: 7500,
+            has_price_oracle: true,
+            volatility_bps: 0,
+        },
+    );
+    lending.set_asset_oracle_prices(admin, &collateral_asset, &vec![env, 10_000_000]);
 
     // Lending reads the borrower's credit limit from the reputation contract.
     let reputation_id = env.register(borrower_reputation::BorrowerReputationContract, ());

@@ -62,3 +62,5 @@ contracts/.deployments/
 # playwright
 playwright-report/
 test-results/
+.npm-cache*
+

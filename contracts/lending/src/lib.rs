@@ -265,8 +265,6 @@ pub enum DataKey {
     OraclePriceUpdatedAt(Address),
     /// TWAP fallback price for a collateral asset.
     OracleTwapPrice(Address),
-    /// Last ledger timestamp at which an oracle price was posted.
-    OraclePriceUpdatedAt(Address),
     /// Borrower Loyalty Rewards contract address
     LoyaltyContract,
     /// Reputation tier per loan (0=None, 1=Beginner, ..., 4=Platinum)
@@ -295,8 +293,6 @@ const MAX_PLATFORM_FEE_BPS: u32 = 1000;
 const DEFAULT_FLASH_LOAN_FEE_BPS: u32 = 9;
 /// Safety ceiling on the flash-loan fee (500 bps = 5 %).
 const MAX_FLASH_LOAN_FEE_BPS: u32 = 500;
-/// Lowest annual percentage rate accepted for a loan request (1.00%).
-const MIN_INTEREST_RATE_BPS: u32 = 100;
 /// Oracle prices older than this are not safe for collateral valuation.
 const ORACLE_PRICE_MAX_AGE_SECONDS: u64 = 300;
 
@@ -306,7 +302,7 @@ const RATE_SWITCH_FEE_BPS: u32 = 50;
 /// Cooldown between rate switches: 24 hours in seconds.
 const RATE_SWITCH_COOLDOWN_SECS: u64 = 86_400;
 /// Oracle collateral prices older than this cannot be used for borrowing.
-const MAX_COLLATERAL_PRICE_AGE_SECS: u64 = 3_600;
+pub const MAX_COLLATERAL_PRICE_AGE_SECS: u64 = 3_600;
 
 /// Default collateral factor for assets without explicit config: 75% LTV.
 const DEFAULT_COLLATERAL_FACTOR_BPS: u32 = 7500;
@@ -1271,9 +1267,10 @@ impl LendingContract {
         if amount < MIN_BORROW_AMOUNT {
             panic!("Loan amount below minimum borrow threshold");
         }
-        if interest_rate_bps < MIN_INTEREST_RATE_BPS
-            || interest_rate_bps > MAX_INTEREST_RATE_BPS
-        {
+        if interest_rate_bps < MIN_INTEREST_RATE_BPS {
+            panic!("Interest rate is below the protocol minimum");
+        }
+        if interest_rate_bps > MAX_INTEREST_RATE_BPS {
             panic!("Interest rate is outside protocol bounds");
         }
 
@@ -2016,7 +2013,7 @@ impl LendingContract {
     ///
     fn get_asset_price(env: &Env, asset: &Address, config: &AssetCollateralConfig) -> i128 {
         if !config.has_price_oracle {
-            panic!("Collateral asset requires a configured price oracle");
+            panic!("Collateral asset has no active price oracle: Collateral asset requires a configured price oracle");
         }
 
         let updated_at: u64 = env
@@ -2025,7 +2022,7 @@ impl LendingContract {
             .get(&DataKey::OraclePriceUpdatedAt(asset.clone()))
             .expect("No oracle price registered for collateral asset");
         if env.ledger().timestamp() > updated_at + ORACLE_PRICE_MAX_AGE_SECONDS {
-            panic!("Oracle price for collateral asset is stale");
+            panic!("Collateral oracle price is stale: Oracle price for collateral asset is stale");
         }
 
         let samples: Vec<i128> = env
