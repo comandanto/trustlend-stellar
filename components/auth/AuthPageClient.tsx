@@ -1,773 +1,176 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { useState } from "react";
+import Image from "next/image";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
-import { useRouter } from "next/navigation";
-import { Loader2, Mail, Eye, EyeOff, ArrowLeft, KeyRound, ShieldCheck } from "lucide-react";
-import { getBrowserSupabaseClient } from "@/lib/supabase/client";
-import {
-  PENDING_ROLE_KEY,
-  getDashboardPath,
-  normalizeUserRole,
-  type UserRole,
-} from "@/lib/auth/roles";
+import { motion } from "framer-motion";
+import { ArrowLeft, Check, Coins, Landmark, ShieldCheck, Sparkles, type LucideIcon } from "lucide-react";
+import { StellarSignInButton } from "@/components/auth/StellarSignInButton";
+import { ThemeToggle } from "@/components/ThemeToggle";
+import { cn } from "@/components/ui/cn";
+import { EASE_OUT } from "@/lib/motion";
 
 type AuthSelectableRole = "borrower" | "lender";
 
-type AuthStep =
-  | "sign-up"
-  | "sign-in"
-  | "forgot-password"
-  | "verify-signup-otp"
-  | "verify-signin-otp"
-  | "verify-recovery-otp"
-  | "update-password";
-
-const ROLE_META: Record<UserRole, { label: string; emoji: string; tagline: string; color: string }> = {
+const ROLE_META: Record<AuthSelectableRole, { label: string; icon: LucideIcon; tagline: string; points: string[] }> = {
   borrower: {
     label: "Borrower",
-    emoji: "💸",
-    tagline: "Access micro-loans built on your real financial behavior",
-    color: "var(--purple)",
+    icon: Coins,
+    tagline: "Access micro-loans built on your real financial behavior.",
+    points: ["Behavior-based trust score", "No collateral required", "Repay early, pay less interest"],
   },
   lender: {
     label: "Lender",
-    emoji: "📈",
-    tagline: "Earn transparent returns by funding verified borrowers",
-    color: "#22cf9d",
-  },
-  admin: {
-    label: "Admin",
-    emoji: "🛡️",
-    tagline: "Manage platform operations and verify users",
-    color: "#ef4444",
+    icon: Landmark,
+    tagline: "Earn transparent returns by funding verified borrowers.",
+    points: ["Fund loans directly or via pools", "Every borrower has an on-chain score", "Repayments settle to your wallet"],
   },
 };
 
+const DEFAULT_POINTS = [
+  "Sign in by signing a challenge — no passwords",
+  "Non-custodial: your keys never leave your wallet",
+  "Freighter, xBull, Albedo and WalletConnect supported",
+];
+
 export function AuthPageClient() {
-  const params = useSearchParams();
-  const router = useRouter();
-
-  const paramRole = params.get("role");
-  const initialRole: AuthSelectableRole | null = (paramRole === "borrower" || paramRole === "lender") ? paramRole : null;
-
-  const [role, setRole] = useState<AuthSelectableRole | null>(initialRole);
-  const [authStep, setAuthStep] = useState<AuthStep>("sign-in");
-  const [showPassword, setShowPassword] = useState(false);
-  const [email, setEmail] = useState("");
-  const [fullName, setFullName] = useState("");
-  const [password, setPassword] = useState("");
-  const [otp, setOtp] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
-  const [googleLoading, setGoogleLoading] = useState(false);
-  const [message, setMessage] = useState<{ type: "error" | "info" | "success"; text: string } | null>(null);
-
+  const [role, setRole] = useState<AuthSelectableRole | null>(null);
   const meta = role ? ROLE_META[role] : null;
 
-  const persistRole = () => {
-    if (typeof window !== "undefined") {
-      if (role) {
-        window.localStorage.setItem(PENDING_ROLE_KEY, role);
-      } else {
-        window.localStorage.removeItem(PENDING_ROLE_KEY);
-      }
-    }
-  };
-
-  const isInvalidRefreshTokenError = (value: unknown) => {
-    const text = String(value ?? "").toLowerCase();
-    return text.includes("invalid refresh token") || text.includes("refresh token not found");
-  };
-
-  const recoverLocalAuthState = async (supabase: NonNullable<ReturnType<typeof getBrowserSupabaseClient>>) => {
-    await supabase.auth.signOut({ scope: "local" });
-  };
-
-  const getSupabaseOrFail = () => {
-    const supabase = getBrowserSupabaseClient();
-    if (!supabase) {
-      setMessage({
-        type: "error",
-        text: "Supabase is not configured. Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY.",
-      });
-      return null;
-    }
-
-    return supabase;
-  };
-
-  const handleGoogleSignIn = async () => {
-    if (authStep === "sign-up" && !role) {
-      setMessage({ type: "error", text: "Please select Borrower or Lender before continuing." });
-      return;
-    }
-
-    setGoogleLoading(true);
-    setMessage(null);
-
-    const supabase = getSupabaseOrFail();
-    if (!supabase) {
-      setGoogleLoading(false);
-      return;
-    }
-
-    persistRole();
-
-    let error: { message: string } | null = null;
-
-    try {
-      const response = await supabase.auth.signInWithOAuth({
-        provider: "google",
-        options: { redirectTo: `${window.location.origin}/auth/complete` },
-      });
-      error = response.error;
-    } catch (caughtError) {
-      if (isInvalidRefreshTokenError(caughtError)) {
-        await recoverLocalAuthState(supabase);
-        setMessage({ type: "info", text: "Session was stale. Please try Google sign-in again." });
-        setGoogleLoading(false);
-        return;
-      }
-
-      setMessage({ type: "error", text: "Unable to start Google sign-in right now." });
-      setGoogleLoading(false);
-      return;
-    }
-
-    if (error) {
-      setMessage({ type: "error", text: error.message });
-      setGoogleLoading(false);
-    }
-  };
-
-  const handleSignUp = async () => {
-    if (!email || !password || !fullName.trim()) {
-      setMessage({ type: "error", text: "Name, email, and password are required." });
-      return;
-    }
-    if (!role) {
-      setMessage({ type: "error", text: "Please select Borrower or Lender before creating your account." });
-      return;
-    }
-    if (password.length < 8) {
-      setMessage({ type: "error", text: "Password must be at least 8 characters." });
-      return;
-    }
-
-    setIsLoading(true);
-    setMessage(null);
-    const supabase = getSupabaseOrFail();
-    if (!supabase) {
-      setIsLoading(false);
-      return;
-    }
-
-    persistRole();
-
-    let error: { message: string } | null = null;
-
-    try {
-      const response = await supabase.auth.signInWithOtp({
-        email,
-        options: {
-          shouldCreateUser: true,
-          data: { account_type: role, full_name: fullName.trim() },
-        },
-      });
-      error = response.error;
-    } catch (caughtError) {
-      if (isInvalidRefreshTokenError(caughtError)) {
-        await recoverLocalAuthState(supabase);
-        setMessage({ type: "info", text: "Session was stale. Try creating your account again." });
-        setIsLoading(false);
-        return;
-      }
-
-      setMessage({ type: "error", text: "Unable to send signup OTP right now." });
-      setIsLoading(false);
-      return;
-    }
-
-    setIsLoading(false);
-
-    if (error) {
-      setMessage({ type: "error", text: error.message });
-      return;
-    }
-
-    setMessage({ type: "success", text: "Code sent! Check your email for the 6-digit OTP." });
-    setOtp("");
-    setAuthStep("verify-signup-otp");
-  };
-
-  const handleSignIn = async () => {
-    if (!email) {
-      setMessage({ type: "error", text: "Email is required." });
-      return;
-    }
-
-    setIsLoading(true);
-    setMessage(null);
-    const supabase = getSupabaseOrFail();
-    if (!supabase) {
-      setIsLoading(false);
-      return;
-    }
-
-    let error: { message: string } | null = null;
-
-    try {
-      const response = await supabase.auth.signInWithOtp({
-        email,
-        options: {
-          shouldCreateUser: false,
-        },
-      });
-      error = response.error;
-    } catch (caughtError) {
-      if (isInvalidRefreshTokenError(caughtError)) {
-        await recoverLocalAuthState(supabase);
-        setMessage({ type: "info", text: "Session was stale. Try sending sign-in code again." });
-        setIsLoading(false);
-        return;
-      }
-
-      setMessage({ type: "error", text: "Unable to send sign-in OTP right now." });
-      setIsLoading(false);
-      return;
-    }
-
-    setIsLoading(false);
-
-    if (error) {
-      setMessage({ type: "error", text: error.message });
-      return;
-    }
-
-    setMessage({ type: "success", text: "OTP sent. Enter the 6-digit code to continue." });
-    setOtp("");
-    setAuthStep("verify-signin-otp");
-  };
-
-  const handleForgotPassword = async () => {
-    if (!email) {
-      setMessage({ type: "error", text: "Please enter your email address first." });
-      return;
-    }
-
-    setIsLoading(true);
-    setMessage(null);
-    const supabase = getSupabaseOrFail();
-    if (!supabase) {
-      setIsLoading(false);
-      return;
-    }
-
-    let error: { message: string } | null = null;
-
-    try {
-      const response = await supabase.auth.signInWithOtp({
-        email,
-        options: {
-          shouldCreateUser: false,
-        },
-      });
-      error = response.error;
-    } catch (caughtError) {
-      if (isInvalidRefreshTokenError(caughtError)) {
-        await recoverLocalAuthState(supabase);
-        setMessage({ type: "info", text: "Session was stale. Try sending recovery code again." });
-        setIsLoading(false);
-        return;
-      }
-
-      setMessage({ type: "error", text: "Unable to send recovery OTP right now." });
-      setIsLoading(false);
-      return;
-    }
-
-    setIsLoading(false);
-
-    if (error) {
-      setMessage({ type: "error", text: error.message });
-      return;
-    }
-
-    setMessage({ type: "success", text: "Recovery code sent! Check your email." });
-    setOtp("");
-    setAuthStep("verify-recovery-otp");
-  };
-
-  const handleVerifyOtp = async (type: "signup" | "signin" | "recovery") => {
-    if (!otp || otp.length < 6) {
-      setMessage({ type: "error", text: "Please enter the 6-digit code." });
-      return;
-    }
-
-    setIsLoading(true);
-    setMessage(null);
-    const supabase = getSupabaseOrFail();
-    if (!supabase) {
-      setIsLoading(false);
-      return;
-    }
-
-    const otpType = "email";
-
-    let data: { user?: { user_metadata?: Record<string, unknown> } } | null = null;
-    let error: { message: string } | null = null;
-
-    try {
-      const response = await supabase.auth.verifyOtp({
-        email,
-        token: otp,
-        type: otpType,
-      });
-      data = response.data as { user?: { user_metadata?: Record<string, unknown> } };
-      error = response.error;
-    } catch (caughtError) {
-      if (isInvalidRefreshTokenError(caughtError)) {
-        await recoverLocalAuthState(supabase);
-        setMessage({ type: "info", text: "Session was stale. Please request a new OTP and try again." });
-        setIsLoading(false);
-        return;
-      }
-
-      setMessage({ type: "error", text: "OTP verification failed. Please try again." });
-      setIsLoading(false);
-      return;
-    }
-
-    setIsLoading(false);
-
-    if (error) {
-      setMessage({ type: "error", text: error.message });
-      return;
-    }
-
-    if (type === "signup") {
-      if (!role) {
-        setMessage({ type: "error", text: "Please select a role and request a new signup code." });
-        return;
-      }
-
-      const { data: updatedData, error: updateError } = await supabase.auth.updateUser({
-        password,
-        data: {
-          ...data?.user?.user_metadata,
-          account_type: role,
-          full_name: fullName.trim(),
-        },
-      });
-
-      if (updateError) {
-        setMessage({ type: "error", text: updateError.message });
-        return;
-      }
-
-      const nextRole = normalizeUserRole(updatedData.user?.user_metadata?.account_type);
-      router.push(getDashboardPath(nextRole));
-    } else if (type === "signin") {
-      const nextRole = normalizeUserRole(data?.user?.user_metadata?.account_type);
-      router.push(getDashboardPath(nextRole));
-    } else {
-      setMessage({ type: "success", text: "Code verified. Please enter a new password." });
-      setAuthStep("update-password");
-      setPassword("");
-    }
-  };
-
-  const handleUpdatePassword = async () => {
-    if (!password || password.length < 8) {
-      setMessage({ type: "error", text: "New password must be at least 8 characters." });
-      return;
-    }
-
-    setIsLoading(true);
-    setMessage(null);
-    const supabase = getSupabaseOrFail();
-    if (!supabase) {
-      setIsLoading(false);
-      return;
-    }
-
-    let data: { user?: { user_metadata?: Record<string, unknown> } } | null = null;
-    let error: { message: string } | null = null;
-
-    try {
-      const response = await supabase.auth.updateUser({
-        password: password,
-      });
-      data = response.data as { user?: { user_metadata?: Record<string, unknown> } };
-      error = response.error;
-    } catch (caughtError) {
-      if (isInvalidRefreshTokenError(caughtError)) {
-        await recoverLocalAuthState(supabase);
-        setMessage({ type: "info", text: "Session expired. Request a new recovery code and try again." });
-        setIsLoading(false);
-        return;
-      }
-
-      setMessage({ type: "error", text: "Unable to update password right now." });
-      setIsLoading(false);
-      return;
-    }
-
-    setIsLoading(false);
-
-    if (error) {
-      setMessage({ type: "error", text: error.message });
-      return;
-    }
-
-    const nextRole = normalizeUserRole(data?.user?.user_metadata?.account_type);
-    router.push(getDashboardPath(nextRole));
-  };
-
-  const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    if (authStep === "sign-up") await handleSignUp();
-    else if (authStep === "sign-in") await handleSignIn();
-    else if (authStep === "forgot-password") await handleForgotPassword();
-    else if (authStep === "verify-signup-otp") await handleVerifyOtp("signup");
-    else if (authStep === "verify-signin-otp") await handleVerifyOtp("signin");
-    else if (authStep === "verify-recovery-otp") await handleVerifyOtp("recovery");
-    else if (authStep === "update-password") await handleUpdatePassword();
-  };
-
-  const renderLeftPanel = () => {
-    if (authStep === "sign-up" || authStep === "verify-signup-otp") {
-      return (
-        <div className="auth-page-left-body">
-          <div className="auth-page-role-badge" style={{ background: role === "lender" ? "rgba(34,207,157,0.12)" : "rgba(127,47,209,0.12)", borderColor: role === "lender" ? "rgba(34,207,157,0.35)" : "rgba(127,47,209,0.35)" }}>
-            <span className="auth-page-role-emoji">{meta?.emoji ?? "👤"}</span>
-            <span className="auth-page-role-badge-label" style={{ color: role === "lender" ? "#17a87a" : "#6e2fc1" }}>
-              {meta ? `Joining as ${meta.label}` : "Choose your account type"}
-            </span>
-          </div>
-          <p className="auth-page-left-tagline">{meta?.tagline ?? "Pick Borrower or Lender to tailor your dashboard and onboarding."}</p>
-          <ul className="auth-page-trust-list" aria-label="Platform highlights">
-            <li><span className="auth-page-trust-dot" />Behavior-based reputation score</li>
-            <li><span className="auth-page-trust-dot" />No collateral required</li>
-            <li><span className="auth-page-trust-dot" />Transparent on-chain audit trail</li>
-            <li><span className="auth-page-trust-dot" />Role dashboard from day one</li>
-          </ul>
-        </div>
-      );
-    }
-
-    // Sign in / Recovery / Password update forms
-    return (
-      <div className="auth-page-left-body">
-        <div className="auth-page-role-badge" style={{ background: "rgba(255,255,255,0.1)", borderColor: "rgba(255,255,255,0.2)" }}>
-          <span className="auth-page-role-emoji">👋</span>
-          <span className="auth-page-role-badge-label" style={{ color: "#ffffff" }}>
-            {authStep === "sign-in" ? "Welcome back" : "Account Recovery"}
-          </span>
-        </div>
-        <p className="auth-page-left-tagline">
-          {authStep === "sign-in" ? "Sign in to access your TrustLend dashboard" : "Securely regain access to your reputation profile"}
-        </p>
-      </div>
-    );
-  };
-
   return (
-    <main className="auth-page-shell">
-      {/* Left panel — branding */}
-      <div className="auth-page-left" aria-hidden="true">
-        <div className="auth-page-left-inner">
-          <Link href="/" className="auth-page-logo">
-            <span className="site-logo-orb" />
-            <span className="font-display auth-page-logo-text">TrustLend</span>
+    <main className="grid min-h-screen bg-bg text-fg lg:grid-cols-[1.05fr_1fr]">
+      {/* Left — brand panel */}
+      <aside className="relative hidden overflow-hidden bg-[image:var(--gradient-primary)] p-10 text-white lg:flex lg:flex-col lg:justify-between" aria-hidden="true">
+        <div className="pointer-events-none absolute inset-0">
+          <div className="absolute -left-20 top-1/3 h-72 w-72 rounded-full bg-white/10 blur-3xl" />
+          <div className="absolute -right-10 bottom-10 h-96 w-96 rounded-full bg-accent/30 blur-3xl" />
+        </div>
+
+        <Link href="/" className="relative flex items-center gap-2.5">
+          <Image src="/logo.png" alt="" width={36} height={36} className="h-9 w-9 rounded-xl object-cover" />
+          <span className="font-display text-lg font-bold tracking-tight">TrustLend</span>
+        </Link>
+
+        <div className="relative max-w-md">
+          <motion.div
+            key={role ?? "none"}
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.35, ease: EASE_OUT }}
+          >
+            <span className="inline-flex items-center gap-2 rounded-full border border-white/25 bg-white/10 px-3 py-1 text-xs font-semibold backdrop-blur">
+              {meta ? <meta.icon className="h-3.5 w-3.5" /> : <Sparkles className="h-3.5 w-3.5" />}
+              {meta ? `Joining as ${meta.label}` : "Welcome to TrustLend"}
+            </span>
+            <h2 className="mt-5 font-display text-3xl font-bold leading-tight tracking-tight xl:text-4xl">
+              {meta ? meta.tagline : "Credit built on behavior, not collateral."}
+            </h2>
+            <ul className="mt-6 space-y-3 text-sm text-white/85">
+              {(meta ? meta.points : DEFAULT_POINTS).map((p) => (
+                <li key={p} className="flex items-center gap-3">
+                  <span className="grid h-5 w-5 shrink-0 place-items-center rounded-full bg-white/15">
+                    <Check className="h-3 w-3" />
+                  </span>
+                  {p}
+                </li>
+              ))}
+            </ul>
+          </motion.div>
+        </div>
+
+        <p className="relative flex items-center gap-2 text-xs text-white/70">
+          <ShieldCheck className="h-4 w-4" /> Sign-In with Stellar (SEP-10) · Stellar testnet
+        </p>
+      </aside>
+
+      {/* Right — sign-in */}
+      <section className="flex flex-col px-6 py-8 sm:px-10 lg:px-16">
+        <div className="flex items-center justify-between">
+          <Link href="/" className="inline-flex items-center gap-2 text-sm font-medium text-fg-muted transition-colors hover:text-fg">
+            <ArrowLeft className="h-4 w-4" aria-hidden="true" />
+            Back to home
           </Link>
-
-          {renderLeftPanel()}
-
-          {/* Decorative orbs */}
-          <div className="auth-left-orb auth-left-orb-1" />
-          <div className="auth-left-orb auth-left-orb-2" />
+          <ThemeToggle />
         </div>
-      </div>
 
-      {/* Right panel — form */}
-      <div className="auth-page-right">
-        <div className="auth-page-form-wrap">
-          {/* Back link */}
-          <button type="button" onClick={() => authStep === "sign-up" || authStep === "sign-in" ? router.push('/') : setAuthStep("sign-in")} className="auth-page-back bg-transparent border-0 cursor-pointer text-left p-0 mb-6">
-            <ArrowLeft size={14} />
-            {authStep === "sign-up" || authStep === "sign-in" ? "Back to home" : "Back to sign in"}
-          </button>
+        <motion.div
+          initial={{ opacity: 0, y: 16 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.45, ease: EASE_OUT }}
+          className="mx-auto flex w-full max-w-md flex-1 flex-col justify-center py-10"
+        >
+          <div className="mb-8 flex items-center gap-2.5 lg:hidden">
+            <Image src="/logo.png" alt="" width={32} height={32} className="h-8 w-8 rounded-lg object-cover" />
+            <span className="font-display text-lg font-bold tracking-tight">TrustLend</span>
+          </div>
 
-          {/* Mode switch & Role picker only on entry screens */}
-          {(authStep === "sign-in" || authStep === "sign-up") && (
-            <>
-              {/* Mode toggle */}
-              <div className="auth-page-mode-toggle">
-                <button
-                  type="button"
-                  id="mode-signin"
-                  className={`auth-page-mode-btn${authStep === "sign-in" ? " auth-page-mode-btn--active" : ""}`}
-                  onClick={() => { setAuthStep("sign-in"); setMessage(null); setOtp(""); }}
-                >
-                  Sign in
-                </button>
-                <button
-                  type="button"
-                  id="mode-signup"
-                  className={`auth-page-mode-btn${authStep === "sign-up" ? " auth-page-mode-btn--active" : ""}`}
-                  onClick={() => { setAuthStep("sign-up"); setMessage(null); setOtp(""); }}
-                >
-                  Create account
-                </button>
-              </div>
+          <h1 className="font-display text-3xl font-bold tracking-tight">Connect your wallet</h1>
+          <p className="mt-2 text-sm text-fg-muted">Choose your role, then sign in with your Stellar wallet.</p>
 
-            </>
-          )}
-
-          {/* Titles */}
-          {authStep === "sign-up" && (
-            <>
-              <h1 className="auth-page-title font-display">{meta ? `Join as ${meta.label}` : "Create your account"}</h1>
-              <p className="auth-page-subtitle">Set your password, then choose Borrower or Lender to continue.</p>
-            </>
-          )}
-          {authStep === "sign-in" && (
-            <>
-              <h1 className="auth-page-title font-display">Welcome back</h1>
-              <p className="auth-page-subtitle">Enter your email and we&apos;ll send a 6-digit sign-in OTP.</p>
-            </>
-          )}
-          {authStep === "forgot-password" && (
-            <>
-              <h1 className="auth-page-title font-display">Reset password</h1>
-              <p className="auth-page-subtitle">Enter your email and we&apos;ll send you a 6-digit code.</p>
-            </>
-          )}
-          {(authStep === "verify-signup-otp" || authStep === "verify-signin-otp" || authStep === "verify-recovery-otp") && (
-            <>
-              <h1 className="auth-page-title font-display">Check your email</h1>
-              <p className="auth-page-subtitle">We sent a 6-digit code to <strong>{email}</strong>.</p>
-            </>
-          )}
-          {authStep === "update-password" && (
-            <>
-              <h1 className="auth-page-title font-display">New password</h1>
-              <p className="auth-page-subtitle">Enter a strong password to secure your account.</p>
-            </>
-          )}
-
-          {/* Google button (only on sign-up and sign-in) */}
-          {(authStep === "sign-in" || authStep === "sign-up") && (
-            <button
-              type="button"
-              id="google-auth-btn"
-              className="auth-page-google-btn"
-              onClick={handleGoogleSignIn}
-              disabled={googleLoading || isLoading}
-            >
-              {googleLoading ? (
-                <Loader2 size={16} className="animate-spin" />
-              ) : (
-                <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
-                  <path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z" />
-                  <path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z" />
-                  <path fill="#FBBC05" d="M3.964 10.71A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.042l3.007-2.332z" />
-                  <path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58z" />
-                </svg>
-              )}
-              Continue with Google
-            </button>
-          )}
-
-          {(authStep === "sign-in" || authStep === "sign-up") && (
-            <div className="auth-page-divider" aria-hidden="true">
-              <span>or continue with email</span>
-            </div>
-          )}
-
-          {/* Form */}
-          <form className="auth-page-form" onSubmit={handleSubmit} noValidate>
-            {(authStep === "sign-up" || authStep === "sign-in" || authStep === "forgot-password") && (
-              <>
-                {authStep === "sign-up" && (
-                  <div className="auth-page-field">
-                    <label className="auth-page-label" htmlFor="auth-fullname">
-                      Full name
-                    </label>
-                    <input
-                      id="auth-fullname"
-                      name="fullname"
-                      type="text"
-                      autoComplete="name"
-                      required
-                      className="auth-page-input"
-                      placeholder="John Doe"
-                      value={fullName}
-                      onChange={(e) => setFullName(e.target.value)}
-                      disabled={isLoading}
-                    />
-                  </div>
-                )}
-
-                <div className="auth-page-field">
-                  <label className="auth-page-label" htmlFor="auth-email">
-                    Email address
-                  </label>
-                  <input
-                    id="auth-email"
-                    name="email"
-                    type="email"
-                    autoComplete="email"
-                    required
-                    className="auth-page-input"
-                    placeholder="you@example.com"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    disabled={isLoading}
-                  />
-                </div>
-
-                {authStep === "sign-in" && (
+          <div className="mt-8" role="group" aria-label="Choose your role">
+            <p className="text-xs font-semibold uppercase tracking-wide text-fg-muted">I am a</p>
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              {(["borrower", "lender"] as AuthSelectableRole[]).map((r) => {
+                const Icon = ROLE_META[r].icon;
+                const active = role === r;
+                return (
                   <button
+                    key={r}
                     type="button"
-                    onClick={() => {
-                      setAuthStep("forgot-password");
-                      setMessage(null);
-                      setOtp("");
-                    }}
-                    className="auth-page-forgot bg-transparent border-0 cursor-pointer p-0 self-start"
+                    id={`role-tab-${r}`}
+                    onClick={() => setRole(r)}
+                    aria-pressed={active}
+                    className={cn(
+                      "flex flex-col items-start gap-3 rounded-card border p-4 text-left transition-[border-color,box-shadow,background-color]",
+                      "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                      active
+                        ? "border-primary bg-primary-soft/60 shadow-glow"
+                        : "border-border bg-surface hover:border-border-strong hover:bg-surface-hover",
+                    )}
                   >
-                    Forgot password?
-                  </button>
-                )}
-              </>
-            )}
-
-            {(authStep === "verify-signup-otp" || authStep === "verify-signin-otp" || authStep === "verify-recovery-otp") && (
-              <div className="auth-page-field">
-                <label className="auth-page-label" htmlFor="auth-otp">
-                  6-Digit OTP Code
-                </label>
-                <input
-                  id="auth-otp"
-                  name="otp"
-                  type="text"
-                  autoComplete="one-time-code"
-                  maxLength={6}
-                  required
-                  style={{ letterSpacing: "0.2em", fontSize: "1.2rem", textAlign: "center", fontWeight: "bold" }}
-                  className="auth-page-input"
-                  placeholder="000000"
-                  value={otp}
-                  onChange={(e) => setOtp(e.target.value.replace(/[^0-9]/g, ""))}
-                  disabled={isLoading}
-                />
-              </div>
-            )}
-
-            {(authStep === "sign-up" || authStep === "update-password") && (
-              <div className="auth-page-field">
-                <div className="auth-page-label-row">
-                  <label className="auth-page-label" htmlFor="auth-password">
-                    {authStep === "update-password" ? "New Password" : "Password"}
-                  </label>
-                </div>
-                <div className="auth-page-input-wrap">
-                  <input
-                    id="auth-password"
-                    name="password"
-                    type={showPassword ? "text" : "password"}
-                    autoComplete="new-password"
-                    required
-                    className="auth-page-input auth-page-input--padded"
-                    placeholder="At least 8 characters"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    disabled={isLoading}
-                  />
-                  <button
-                    type="button"
-                    className="auth-page-eye-btn"
-                    onClick={() => setShowPassword((v) => !v)}
-                    aria-label={showPassword ? "Hide password" : "Show password"}
-                  >
-                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {authStep === "sign-up" && (
-              <div className="auth-page-role-picker" role="group" aria-label="Choose your role">
-                <p className="auth-page-section-label">I am a</p>
-                <div className="auth-page-role-tabs">
-                  {(["borrower", "lender"] as AuthSelectableRole[]).map((r) => (
-                    <button
-                      key={r}
-                      type="button"
-                      id={`role-tab-${r}`}
-                      className={`auth-page-role-tab${role === r ? " auth-page-role-tab--active" : ""}`}
-                      onClick={() => { setRole(r); setMessage(null); }}
-                      aria-pressed={role === r}
+                    <span
+                      className={cn(
+                        "grid h-9 w-9 place-items-center rounded-lg",
+                        active ? "bg-primary text-primary-fg" : "bg-surface-2 text-fg-muted",
+                      )}
                     >
-                      <span className="auth-page-role-tab-emoji">{ROLE_META[r].emoji}</span>
-                      {ROLE_META[r].label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
+                      <Icon className="h-4.5 w-4.5" aria-hidden="true" />
+                    </span>
+                    <span>
+                      <span className="block font-display text-sm font-semibold text-fg">{ROLE_META[r].label}</span>
+                      <span className="mt-0.5 block text-xs text-fg-muted">
+                        {r === "borrower" ? "I want to borrow" : "I want to lend"}
+                      </span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
 
-            {/* Feedback */}
-            {message && (
-              <p
-                className={message.type === "error" ? "auth-page-error" : "auth-page-info"}
-                style={message.type === "success" ? { background: "#e8fcf4", borderColor: "#a0e8cf", color: "#0c704c" } : {}}
-                role="alert"
-              >
-                {message.type === "error" ? "⚠ " : message.type === "success" ? "✓ " : "✉ "}{message.text}
-              </p>
-            )}
+          <div className="mt-8">
+            <StellarSignInButton className="w-full" disabled={!role} role={role ?? undefined} />
+          </div>
 
-            <button
-              type="submit"
-              id="auth-submit-btn"
-              className="auth-page-submit mt-2"
-              disabled={isLoading || googleLoading}
-            >
-              {isLoading ? (
-                <Loader2 size={16} className="animate-spin" />
-              ) : authStep === "verify-signup-otp" || authStep === "verify-signin-otp" || authStep === "verify-recovery-otp" ? (
-                <ShieldCheck size={16} />
-              ) : authStep === "update-password" ? (
-                <KeyRound size={16} />
-              ) : (
-                <Mail size={16} />
-              )}
-              {authStep === "sign-up"
-                ? "Create account"
-                : authStep === "sign-in"
-                  ? "Send sign-in code"
-                  : authStep === "forgot-password"
-                    ? "Send recovery code"
-                    : authStep === "update-password"
-                      ? "Update password"
-                      : "Verify code"}
-            </button>
-          </form>
+          <p className="mt-4 text-center text-xs text-fg-subtle">
+            {role
+              ? "Existing accounts keep their current role; the choice above only applies to new wallets."
+              : "Select a role to continue."}
+          </p>
 
-          {(authStep === "sign-in" || authStep === "sign-up") && (
-            <p className="auth-page-footnote">
-              By continuing, you agree to TrustLend&apos;s{" "}
-              <a href="#" className="auth-page-footnote-link">Terms</a> and{" "}
-              <a href="#" className="auth-page-footnote-link">Privacy Policy</a>.
-              Role decides your dashboard — you can switch later.
-            </p>
-          )}
-        </div>
-      </div>
+          <p className="mt-10 text-center text-xs text-fg-subtle">
+            By continuing you agree to TrustLend&apos;s{" "}
+            <a href="#" className="font-medium text-fg-muted underline-offset-2 hover:underline">
+              Terms
+            </a>{" "}
+            and{" "}
+            <a href="#" className="font-medium text-fg-muted underline-offset-2 hover:underline">
+              Privacy Policy
+            </a>
+            .
+          </p>
+        </motion.div>
+      </section>
     </main>
   );
 }

@@ -8,6 +8,8 @@ import {
   approveLoan,
   runAutoMatch,
 } from "@/app/actions/admin-pools";
+import { formatCurrency } from "@/lib/utils/formatting";
+import { TermTooltip } from "@/components/ui/TermTooltip";
 
 interface Pool {
   id: string;
@@ -17,6 +19,7 @@ interface Pool {
   apr_bps: number;
   total_liquidity: number;
   available_liquidity: number;
+  borrow_cap: number | null;
 }
 
 interface Loan {
@@ -73,9 +76,9 @@ function CreatePoolForm({ onCreated }: { onCreated: () => void }) {
         <div
           style={{
             padding: "1.5rem",
-            border: "1px solid rgba(126, 47, 208, 0.3)",
+            border: "1px solid color-mix(in srgb, var(--primary) 30%, transparent)",
             borderRadius: "0.75rem",
-            background: "rgba(126, 47, 208, 0.04)",
+            background: "color-mix(in srgb, var(--primary) 4%, transparent)",
             marginBottom: "1.5rem",
           }}
         >
@@ -103,8 +106,16 @@ function CreatePoolForm({ onCreated }: { onCreated: () => void }) {
               />
             </div>
             <div>
-              <label className="workspace-label">APR (basis points) *</label>
+              {/* Tooltip buttons sit beside the label, not inside it — a
+                  <label> must not contain another interactive control. */}
+              <span className="term-tooltip">
+                <label className="workspace-label" htmlFor="pool-apr-bps">
+                  APR (basis points) *
+                </label>
+                <TermTooltip term="BASIS_POINTS" side="top" />
+              </span>
               <input
+                id="pool-apr-bps"
                 name="apr_bps"
                 type="number"
                 required
@@ -117,8 +128,34 @@ function CreatePoolForm({ onCreated }: { onCreated: () => void }) {
               <p className="workspace-hint">1500 = 15.00% APR</p>
             </div>
 
+            {/* Borrow Cap */}
+            <div>
+              <label
+                htmlFor="pool-borrow-cap"
+                className="workspace-label"
+              >
+                Borrow Cap (XLM){" "}
+                <span style={{ fontWeight: 400, opacity: 0.6, fontSize: "0.78rem" }}>
+                  (optional — leave blank for no cap)
+                </span>
+              </label>
+              <input
+                id="pool-borrow-cap"
+                name="borrow_cap"
+                type="number"
+                min="1"
+                step="any"
+                placeholder="e.g. 50000"
+                className="workspace-input"
+                onWheel={(e) => (e.target as HTMLInputElement).blur()}
+              />
+              <p className="workspace-hint">
+                Hard ceiling on total XLM that can be borrowed from this pool. Protects against over-exposure.
+              </p>
+            </div>
+
             {msg && (
-              <p style={{ color: msg.ok ? "#22cf9d" : "#ff6b6b", fontSize: "0.875rem" }}>
+              <p style={{ color: msg.ok ? "var(--accent)" : "var(--danger)", fontSize: "0.875rem" }}>
                 {msg.text}
               </p>
             )}
@@ -176,16 +213,27 @@ function PoolRow({ pool, onChanged }: { pool: Pool; onChanged: () => void }) {
             borderRadius: "9999px",
             fontSize: "0.75rem",
             fontWeight: 600,
-            background: pool.status === "active" ? "rgba(34,207,157,0.12)" : "rgba(255,107,107,0.12)",
-            color: pool.status === "active" ? "#22cf9d" : "#ff6b6b",
+            background: pool.status === "active" ? "color-mix(in srgb, var(--accent) 12%, transparent)" : "color-mix(in srgb, var(--danger) 12%, transparent)",
+            color: pool.status === "active" ? "var(--accent)" : "var(--danger)",
           }}
         >
           {pool.status.toUpperCase()}
         </span>
       </td>
       <td>{(pool.apr_bps / 100).toFixed(2)}%</td>
-      <td>{Number(pool.total_liquidity).toFixed(2)} XLM</td>
-      <td>{Number(pool.available_liquidity).toFixed(2)} XLM</td>
+      <td>{formatCurrency(Number(pool.total_liquidity))}</td>
+      <td>{formatCurrency(Number(pool.available_liquidity))}</td>
+      <td>
+        {pool.borrow_cap !== null && pool.borrow_cap !== undefined ? (
+          <span style={{ fontWeight: 600, color: "var(--warning)" }}>
+            {Number(pool.borrow_cap).toLocaleString()} XLM
+          </span>
+        ) : (
+          <span style={{ color: "color-mix(in srgb, var(--fg) 35%, transparent)", fontStyle: "italic", fontSize: "0.82rem" }}>
+            No cap
+          </span>
+        )}
+      </td>
       <td>
         <button
           onClick={handleToggle}
@@ -195,7 +243,7 @@ function PoolRow({ pool, onChanged }: { pool: Pool; onChanged: () => void }) {
         >
           {pending ? "..." : pool.status === "active" ? "Pause" : "Activate"}
         </button>
-        {msg && <p style={{ color: "#ff6b6b", fontSize: "0.72rem", marginTop: "0.2rem" }}>{msg}</p>}
+        {msg && <p style={{ color: "var(--danger)", fontSize: "0.72rem", marginTop: "0.2rem" }}>{msg}</p>}
       </td>
     </tr>
   );
@@ -226,12 +274,12 @@ function LoanRow({ loan, pools, onApproved }: { loan: Loan; pools: Pool[]; onApp
     <tr>
       <td style={{ fontFamily: "monospace", fontSize: "0.82rem" }}>{String(loan.id).slice(0, 8)}</td>
       <td>{loan.borrower_profile?.full_name ?? "—"}</td>
-      <td>{Number(loan.principal_amount).toFixed(2)} XLM</td>
+      <td>{formatCurrency(Number(loan.principal_amount))}</td>
       <td>{(loan.apr_bps / 100).toFixed(2)}%</td>
       <td>{loan.duration_days}d</td>
       <td>
         {msg ? (
-          <span style={{ fontSize: "0.82rem", color: msg.startsWith("✅") ? "#22cf9d" : "#ff6b6b" }}>
+          <span style={{ fontSize: "0.82rem", color: msg.startsWith("✅") ? "var(--accent)" : "var(--danger)" }}>
             {msg}
           </span>
         ) : (
@@ -247,7 +295,7 @@ function LoanRow({ loan, pools, onApproved }: { loan: Loan; pools: Pool[]; onApp
               ) : (
                 activePools.map((p) => (
                   <option key={p.id} value={p.id}>
-                    {p.name} ({Number(p.available_liquidity).toFixed(0)} XLM available)
+                    {p.name} ({formatCurrency(Number(p.available_liquidity))} available)
                   </option>
                 ))
               )}
@@ -295,8 +343,8 @@ function AutoMatchBar({ pendingCount, onDone }: { pendingCount: number; onDone: 
         gap: "1rem",
         padding: "0.85rem 1.2rem",
         borderRadius: "0.6rem",
-        background: "rgba(34,207,157,0.06)",
-        border: "1px solid rgba(34,207,157,0.2)",
+        background: "color-mix(in srgb, var(--accent) 6%, transparent)",
+        border: "1px solid color-mix(in srgb, var(--accent) 20%, transparent)",
         marginBottom: "1.5rem",
         flexWrap: "wrap",
       }}
@@ -311,11 +359,11 @@ function AutoMatchBar({ pendingCount, onDone }: { pendingCount: number; onDone: 
         </p>
       </div>
       {result && (
-        <span style={{ fontSize: "0.82rem", color: "#22cf9d" }}>
+        <span style={{ fontSize: "0.82rem", color: "var(--accent)" }}>
           ✅ {result.matched} matched, {result.skipped} skipped
         </span>
       )}
-      {error && <span style={{ fontSize: "0.82rem", color: "#ff6b6b" }}>{error}</span>}
+      {error && <span style={{ fontSize: "0.82rem", color: "var(--danger)" }}>{error}</span>}
       <button
         onClick={handleRun}
         disabled={pending || pendingCount === 0}
@@ -355,6 +403,7 @@ export default function AdminPoolsClient({ pools, pendingLoans }: AdminPoolsClie
                   <th>APR</th>
                   <th>Total Liquidity</th>
                   <th>Available</th>
+                  <th>Borrow Cap</th>
                   <th>Actions</th>
                 </tr>
               </thead>
@@ -376,8 +425,8 @@ export default function AdminPoolsClient({ pools, pendingLoans }: AdminPoolsClie
             <span
               style={{
                 marginLeft: "0.75rem",
-                background: "rgba(255,107,107,0.15)",
-                color: "#ff6b6b",
+                background: "color-mix(in srgb, var(--danger) 15%, transparent)",
+                color: "var(--danger)",
                 borderRadius: "9999px",
                 padding: "0.15rem 0.6rem",
                 fontSize: "0.75rem",

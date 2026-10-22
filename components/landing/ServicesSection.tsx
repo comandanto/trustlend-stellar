@@ -1,82 +1,95 @@
-import { MonitorPlay, TrendingUp, ShieldCheck, Zap } from "lucide-react";
+"use client";
+
+import { motion } from "framer-motion";
+import { Activity, Globe2, ShieldCheck, Zap } from "lucide-react";
 import type { HighlightContent, MetricItem } from "@/types/landing";
+import { CountUp } from "@/components/ui/stat-card";
+import { revealOnScroll, stagger, staggerItem } from "@/lib/motion";
+import { SectionHeading } from "./SectionHeading";
 
 interface ServicesSectionProps {
   metrics: MetricItem[];
   content: HighlightContent;
 }
 
+const FEATURES = [
+  {
+    icon: Activity,
+    title: "Behavior-based scoring",
+    body: "Repayments, lending activity and transaction discipline move the score — not collateral or paid tasks.",
+  },
+  {
+    icon: ShieldCheck,
+    title: "Enforced by contracts",
+    body: "Loan terms, escrow and defaults are handled by Soroban smart contracts you can read and verify.",
+  },
+  {
+    icon: Zap,
+    title: "Settles in seconds",
+    body: "Stellar's rails move funds globally for a fraction of a cent, so payouts and repayments are instant.",
+  },
+  {
+    icon: Globe2,
+    title: "Built for emerging markets",
+    body: "Designed for freelancers and gig workers who have income history but no bank credit file.",
+  },
+];
+
 export function ServicesSection({ metrics, content }: ServicesSectionProps) {
   return (
-    <>
-      <section id="introduce" className="metrics-strip section-anchor">
-        <div className="crypto-container grid gap-5 py-10 md:grid-cols-4">
+    <section id="introduce" className="section-anchor">
+      <div className="crypto-container">
+        {/* Metric strip */}
+        <motion.dl
+          variants={stagger}
+          initial="hidden"
+          whileInView="show"
+          viewport={{ once: true, margin: "-60px" }}
+          className="grid grid-cols-2 gap-px overflow-hidden rounded-card border border-border bg-border lg:grid-cols-4"
+        >
           {metrics.map((item) => (
-            <article key={item.label} className="metric-card">
-              <p className="metric-value font-display">{item.value}</p>
-              <p className="metric-label">{item.label}</p>
-            </article>
+            <motion.div key={item.label} variants={staggerItem} className="bg-surface px-6 py-6">
+              <dt className="text-xs font-semibold uppercase tracking-wide text-fg-muted">{item.label}</dt>
+              <dd className="mt-2 font-display text-3xl font-extrabold tracking-tight text-fg">
+                <CountUp value={item.value} />
+              </dd>
+            </motion.div>
           ))}
+        </motion.dl>
+
+        <div className="py-20 md:py-24">
+          <SectionHeading eyebrow="Why TrustLend" title={content.title} description={content.description} />
+
+          <motion.div
+            variants={stagger}
+            initial="hidden"
+            whileInView="show"
+            viewport={{ once: true, margin: "-60px" }}
+            className="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"
+          >
+            {FEATURES.map(({ icon: Icon, title, body }) => (
+              <motion.article
+                key={title}
+                variants={staggerItem}
+                className="group rounded-card border border-border bg-surface p-6 shadow-card transition-transform duration-200 hover:-translate-y-0.5"
+              >
+                <span className="grid h-10 w-10 place-items-center rounded-lg bg-primary-soft text-primary-soft-fg">
+                  <Icon className="h-5 w-5" aria-hidden="true" />
+                </span>
+                <h3 className="mt-4 font-display text-base font-semibold text-fg">{title}</h3>
+                <p className="mt-2 text-sm leading-relaxed text-fg-muted">{body}</p>
+              </motion.article>
+            ))}
+          </motion.div>
+
+          <motion.p
+            {...revealOnScroll}
+            className="mx-auto mt-10 max-w-2xl rounded-card border border-accent/30 bg-accent-soft/60 px-5 py-4 text-center text-sm font-medium text-accent-soft-fg"
+          >
+            {content.callout}
+          </motion.p>
         </div>
-      </section>
-
-      <section className="showcase-section">
-        <div className="crypto-container grid items-center gap-12 py-20 lg:grid-cols-[0.9fr_1.1fr]">
-          <article>
-            <p className="showcase-kicker">HIGHLIGHT</p>
-            <h2 className="showcase-title font-display">{content.title}</h2>
-            <p className="showcase-description">{content.description}</p>
-            <p className="showcase-callout">{content.callout}</p>
-
-            {/* Project summary blurb */}
-            <div className="showcase-project-blurb">
-              <div className="showcase-blurb-item">
-                <ShieldCheck size={16} className="showcase-blurb-icon" />
-                <span>4 Soroban smart contracts live on Stellar Testnet</span>
-              </div>
-              <div className="showcase-blurb-item">
-                <Zap size={16} className="showcase-blurb-icon" />
-                <span>On-chain reputation scoring — no collateral required</span>
-              </div>
-              <div className="showcase-blurb-item">
-                <TrendingUp size={16} className="showcase-blurb-icon" />
-                <span>Escrow-protected disbursement with 3-min revocation window</span>
-              </div>
-            </div>
-          </article>
-
-          <article className="dashboard-shell">
-            <div className="dashboard-bar" />
-            <div className="dashboard-grid">
-              <div className="dashboard-card dashboard-card-strong">
-                <span className="dashboard-caption">Trust graph</span>
-                <TrendingUp size={18} />
-                <span className="dashboard-card-stat">+82 pts</span>
-              </div>
-              <div className="dashboard-card dashboard-card-accent">
-                <span className="dashboard-caption">Risk monitor</span>
-                <MonitorPlay size={18} />
-                <span className="dashboard-card-stat">LOW</span>
-              </div>
-              <div className="dashboard-chart">
-                <div className="dashboard-chart-bars">
-                  <span style={{ height: "40%" }} />
-                  <span style={{ height: "65%" }} />
-                  <span style={{ height: "50%" }} />
-                  <span style={{ height: "80%" }} />
-                  <span style={{ height: "60%" }} />
-                  <span style={{ height: "90%" }} />
-                </div>
-                <span className="dashboard-caption" style={{ marginTop: "0.5rem" }}>Loan volume</span>
-              </div>
-              <div className="dashboard-mini">
-                <span className="dashboard-caption">Insurance pool</span>
-                <span className="dashboard-mini-value">Funded</span>
-              </div>
-            </div>
-          </article>
-        </div>
-      </section>
-    </>
+      </div>
+    </section>
   );
 }

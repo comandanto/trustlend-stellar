@@ -1,68 +1,66 @@
 import { WorkspaceFrame } from "@/components/dashboard/WorkspaceFrame";
 import { WalletCard } from "@/components/dashboard/WalletCard";
 import { requireAuthenticatedUser } from "@/lib/auth/session";
-import { getLenderDashboardMetrics, presentLenderMetrics } from "@/lib/dashboard/metrics";
-import { getServerSupabaseClient, getServiceRoleClient } from "@/lib/supabase/server";
-import { formatCurrency } from "@/lib/utils/formatting";
+import {
+  getLenderDashboardMetrics,
+  presentLenderMetrics,
+} from "@/lib/dashboard/metrics";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { getDb } from "@/lib/db/client";
+import { metaString } from "@/lib/db/metadata";
+import { getProfile } from "@/lib/db/queries";
+import { ledgerToRow, loanToRow, positionToRow } from "@/lib/db/rows";
+import { ledgerTransactions, loans as loansTable, poolPositions } from "@/lib/db/schema";
+import { formatTokenBalance } from "@/lib/utils/formatting";
 import { lenderNavLinks } from "@/lib/dashboard/lender-links";
+import { LenderUtilizationChart } from "@/components/dashboard/LenderUtilizationChart";
 import Link from "next/link";
 
 export default async function LenderHomePage() {
   const { user } = await requireAuthenticatedUser("lender");
-  const walletAddress = String(user.user_metadata?.wallet_address ?? "") || null;
+  const walletAddress =
+    String(user.walletAddress ?? "") || null;
   const metrics = await getLenderDashboardMetrics(user.id);
-  const supabase = await getServerSupabaseClient();
-  const srClient = getServiceRoleClient();
+  const db = getDb();
 
-  const [positionsRes, profileRes, p2pRes, openLoanCountRes, allLoansRes, repaysRes] = supabase && srClient
+  const [positionRows, profile, p2pRows, [openLoanCountRow], allLoanRows, repayRows] = db
     ? await Promise.all([
-        supabase
-          .from("pool_positions")
-          .select("id, pool_id, status, principal_amount, earned_interest")
-          .eq("lender_id", user.id)
-          .order("created_at", { ascending: false })
+        db
+          .select()
+          .from(poolPositions)
+          .where(eq(poolPositions.lenderId, user.id))
+          .orderBy(desc(poolPositions.createdAt))
           .limit(5),
-        supabase
-          .from("profiles")
-          .select("full_name, kyc_status")
-          .eq("id", user.id)
-          .maybeSingle(),
-        supabase
-          .from("ledger_transactions")
-          .select("id, ref_id, amount, status, metadata, created_at")
-          .eq("user_id", user.id)
-          .eq("ref_type", "loan_fund")
-          .order("created_at", { ascending: false })
+        getProfile(db, user.id),
+        db
+          .select()
+          .from(ledgerTransactions)
+          .where(and(eq(ledgerTransactions.userId, user.id), eq(ledgerTransactions.refType, "loan_fund")))
+          .orderBy(desc(ledgerTransactions.createdAt))
           .limit(20),
-        supabase
-          .from("loans")
-          .select("id", { count: "exact", head: true })
-          .in("status", ["requested", "approved"]),
-        srClient
-          .from("loans")
-          .select("id, status, repaid_amount, principal_amount"),
-        srClient
-          .from("ledger_transactions")
-          .select("ref_id, metadata")
-          .eq("ref_type", "loan_repay")
+        db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(loansTable)
+          .where(inArray(loansTable.status, ["requested", "approved"])),
+        db.select().from(loansTable),
+        db
+          .select({ ref_id: ledgerTransactions.refId, metadata: ledgerTransactions.metadata })
+          .from(ledgerTransactions)
+          .where(eq(ledgerTransactions.refType, "loan_repay")),
       ])
-    : [{ data: [] }, { data: null }, { data: [] }, { count: 0 }, { data: [] }, { data: [] }];
+    : [[], null, [], [{ count: 0 }], [], []];
 
-  const positions     = positionsRes.data ?? [];
-  const p2pInvestments = p2pRes.data ?? [];
-  const profile       = profileRes.data;
-  const openLoanCount = openLoanCountRes.count ?? 0;
+  const positions = positionRows.map(positionToRow);
+  const p2pInvestments = p2pRows.map(ledgerToRow);
+  const openLoanCount = openLoanCountRow?.count ?? 0;
   const isKycVerified = profile?.kyc_status === "verified";
-  
-  const allLoansArray = allLoansRes.data ?? [];
-  const loanMap = Object.fromEntries(allLoansArray.map(l => [String(l.id), l]));
+
+  const loanMap = Object.fromEntries(allLoanRows.map(loanToRow).map((l) => [l.id, l]));
 
   const repayMap: Record<string, string> = {};
-  for (const r of (repaysRes.data ?? [])) {
-     try {
-       const m = JSON.parse(String(r.metadata || "{}"));
-       if (m.txHash) repayMap[String(r.ref_id)] = m.txHash;
-     } catch {}
+  for (const r of repayRows) {
+    const hash = metaString(r.metadata, "txHash");
+    if (hash && r.ref_id) repayMap[r.ref_id] = hash;
   }
 
   const netEarnings = metrics.totalEarnings;
@@ -73,9 +71,11 @@ export default async function LenderHomePage() {
       heading="Welcome back 👋"
       description="Your lending overview at a glance. Use the navigation to fund loans or manage your pool investments."
       email={user.email ?? null}
-      userName={String(user.user_metadata?.full_name ?? profile?.full_name ?? "")}
+      userName={String(
+        user.fullName ?? profile?.full_name ?? "",
+      )}
       metrics={presentLenderMetrics(metrics)}
-      headerWidget={(
+      headerWidget={
         <WalletCard
           address={walletAddress}
           available={0}
@@ -85,72 +85,131 @@ export default async function LenderHomePage() {
           pendingLabel="Total Profit Earned"
           compact
         />
-      )}
+      }
       currentPath="/dashboard/lender"
       profilePath="/dashboard/lender/profile"
       showProfileAlert={false}
       links={lenderNavLinks}
     >
       <div className="workspace-stack">
-
         {/* ── Quick action cards ──────────────────────────────────── */}
         <section className="workspace-grid workspace-grid--two">
-
           {/* P2P Marketplace CTA */}
-          <Link href="/dashboard/lender/marketplace" style={{ textDecoration: "none" }}>
+          <Link
+            href="/dashboard/lender/marketplace"
+            style={{ textDecoration: "none" }}
+          >
             <article
               className="workspace-card"
               style={{
                 cursor: "pointer",
-                border: "1px solid rgba(126,47,208,0.35)",
+                border: "1px solid color-mix(in srgb, var(--primary) 35%, transparent)",
                 transition: "border-color 0.2s, transform 0.15s",
                 height: "100%",
               }}
             >
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "0.75rem" }}>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "flex-start",
+                  marginBottom: "0.75rem",
+                }}
+              >
                 <span style={{ fontSize: "2rem" }}>🏪</span>
                 {openLoanCount > 0 && (
-                  <span style={{ background: "rgba(255,107,107,0.15)", color: "#ff9966", borderRadius: "9999px", padding: "0.2rem 0.7rem", fontSize: "0.75rem", fontWeight: 700 }}>
+                  <span
+                    style={{
+                      background: "color-mix(in srgb, var(--danger) 15%, transparent)",
+                      color: "var(--warning)",
+                      borderRadius: "9999px",
+                      padding: "0.2rem 0.7rem",
+                      fontSize: "0.75rem",
+                      fontWeight: 700,
+                    }}
+                  >
                     {openLoanCount} open
                   </span>
                 )}
               </div>
               <h2 className="workspace-card-title">Loan Marketplace</h2>
-              <p className="workspace-card-copy" style={{ opacity: 0.65, fontSize: "0.875rem" }}>
-                Browse open borrower requests. Fund directly via Freighter — XLM goes
-                straight to the borrower&apos;s Stellar wallet. Earn interest on repayment.
+              <p
+                className="workspace-card-copy"
+                style={{ opacity: 0.65, fontSize: "0.875rem" }}
+              >
+                Browse open borrower requests. Fund directly with Freighter or
+                Albedo — XLM goes straight to the borrower&apos;s Stellar
+                wallet. Earn interest on repayment.
               </p>
-              <p style={{ marginTop: "1rem", fontSize: "0.85rem", color: "#7e2fd0", fontWeight: 600 }}>
+              <p
+                style={{
+                  marginTop: "1rem",
+                  fontSize: "0.85rem",
+                  color: "var(--primary)",
+                  fontWeight: 600,
+                }}
+              >
                 Go to Marketplace →
               </p>
             </article>
           </Link>
 
           {/* Pool Investment CTA */}
-          <Link href="/dashboard/lender/pools" style={{ textDecoration: "none" }}>
+          <Link
+            href="/dashboard/lender/pools"
+            style={{ textDecoration: "none" }}
+          >
             <article
               className="workspace-card"
               style={{
                 cursor: "pointer",
-                border: "1px solid rgba(34,207,157,0.25)",
+                border: "1px solid color-mix(in srgb, var(--accent) 25%, transparent)",
                 transition: "border-color 0.2s, transform 0.15s",
                 height: "100%",
               }}
             >
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "0.75rem" }}>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "flex-start",
+                  marginBottom: "0.75rem",
+                }}
+              >
                 <span style={{ fontSize: "2rem" }}>🏦</span>
                 {positions.length > 0 && (
-                  <span style={{ background: "rgba(34,207,157,0.12)", color: "#22cf9d", borderRadius: "9999px", padding: "0.2rem 0.7rem", fontSize: "0.75rem", fontWeight: 700 }}>
-                    {positions.length} position{positions.length !== 1 ? "s" : ""}
+                  <span
+                    style={{
+                      background: "color-mix(in srgb, var(--accent) 12%, transparent)",
+                      color: "var(--accent)",
+                      borderRadius: "9999px",
+                      padding: "0.2rem 0.7rem",
+                      fontSize: "0.75rem",
+                      fontWeight: 700,
+                    }}
+                  >
+                    {positions.length} position
+                    {positions.length !== 1 ? "s" : ""}
                   </span>
                 )}
               </div>
               <h2 className="workspace-card-title">Pool Investment</h2>
-              <p className="workspace-card-copy" style={{ opacity: 0.65, fontSize: "0.875rem" }}>
-                Deposit XLM into a lending pool and earn passive APR. The pool automatically
-                funds matching borrower requests — no action needed from your side.
+              <p
+                className="workspace-card-copy"
+                style={{ opacity: 0.65, fontSize: "0.875rem" }}
+              >
+                Deposit XLM into a lending pool and earn passive APR. The pool
+                automatically funds matching borrower requests — no action
+                needed from your side.
               </p>
-              <p style={{ marginTop: "1rem", fontSize: "0.85rem", color: "#22cf9d", fontWeight: 600 }}>
+              <p
+                style={{
+                  marginTop: "1rem",
+                  fontSize: "0.85rem",
+                  color: "var(--accent)",
+                  fontWeight: 600,
+                }}
+              >
                 Manage Pools →
               </p>
             </article>
@@ -162,55 +221,131 @@ export default async function LenderHomePage() {
           {[
             {
               label: "Total Deployed",
-              value: `${metrics.deployedCapital.toFixed(2)} XLM`,
+              value: formatTokenBalance(metrics.deployedCapital),
               sub: `${metrics.activePositions} active pool position${metrics.activePositions !== 1 ? "s" : ""}`,
             },
             {
               label: "Net Earnings",
-              value: formatCurrency(netEarnings),
+              value: formatTokenBalance(netEarnings),
               sub: "Total accumulated interest",
               highlight: true,
               positive: netEarnings >= 0,
             },
           ].map((stat) => (
             <article key={stat.label} className="workspace-card">
-              <p style={{ fontSize: "0.78rem", opacity: 0.55, marginBottom: "0.35rem", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+              <p
+                style={{
+                  fontSize: "0.78rem",
+                  opacity: 0.55,
+                  marginBottom: "0.35rem",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.06em",
+                }}
+              >
                 {stat.label}
               </p>
-              <p style={{ fontSize: "1.6rem", fontWeight: 700, color: stat.highlight ? (stat.positive ? "#22cf9d" : "#ff6b6b") : "inherit", lineHeight: 1.1 }}>
+              <p
+                style={{
+                  fontSize: "1.6rem",
+                  fontWeight: 700,
+                  color: stat.highlight
+                    ? stat.positive
+                      ? "var(--accent)"
+                      : "var(--danger)"
+                    : "inherit",
+                  lineHeight: 1.1,
+                }}
+              >
                 {stat.value}
               </p>
-              <p style={{ fontSize: "0.78rem", opacity: 0.45, marginTop: "0.3rem" }}>{stat.sub}</p>
+              <p
+                style={{
+                  fontSize: "0.78rem",
+                  opacity: 0.45,
+                  marginTop: "0.3rem",
+                }}
+              >
+                {stat.sub}
+              </p>
             </article>
           ))}
+        </section>
+
+        {/* ── Pool utilization history ─────────────────────────────── */}
+        <section className="workspace-grid workspace-grid--full">
+          <LenderUtilizationChart range="30d" />
         </section>
 
         {/* ── Recent positions ────────────────────────────────────── */}
         <section style={{ display: "grid", gap: "1.5rem" }}>
           {positions.length > 0 && (
             <article className="workspace-card workspace-card--full">
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.75rem" }}>
-                <h2 className="workspace-card-title" style={{ margin: 0 }}>Recent Pool Deposits</h2>
-                <Link href="/dashboard/lender/pools" className="workspace-nav-link" style={{ fontSize: "0.83rem" }}>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  marginBottom: "0.75rem",
+                }}
+              >
+                <h2 className="workspace-card-title" style={{ margin: 0 }}>
+                  Recent Pool Deposits
+                </h2>
+                <Link
+                  href="/dashboard/lender/pools"
+                  className="workspace-nav-link"
+                  style={{ fontSize: "0.83rem" }}
+                >
                   View all →
                 </Link>
               </div>
               <div className="workspace-table-wrap">
                 <table className="workspace-table">
                   <thead>
-                    <tr><th>Pool ID</th><th>Status</th><th>Your Capital</th><th>Earned</th></tr>
+                    <tr>
+                      <th>Pool ID</th>
+                      <th>Status</th>
+                      <th>Your Capital</th>
+                      <th>Earned</th>
+                    </tr>
                   </thead>
                   <tbody>
                     {positions.map((pos) => (
                       <tr key={String(pos.id)}>
-                        <td style={{ fontFamily: "monospace", fontSize: "0.82rem" }}>{String(pos.pool_id).slice(0, 8)}</td>
+                        <td
+                          style={{
+                            fontFamily: "monospace",
+                            fontSize: "0.82rem",
+                          }}
+                        >
+                          {String(pos.pool_id).slice(0, 8)}
+                        </td>
                         <td>
-                          <span style={{ padding: "0.15rem 0.5rem", borderRadius: "9999px", fontSize: "0.75rem", fontWeight: 600, background: pos.status === "active" ? "rgba(34,207,157,0.12)" : "rgba(255,107,107,0.12)", color: pos.status === "active" ? "#22cf9d" : "#ff6b6b" }}>
+                          <span
+                            style={{
+                              padding: "0.15rem 0.5rem",
+                              borderRadius: "9999px",
+                              fontSize: "0.75rem",
+                              fontWeight: 600,
+                              background:
+                                pos.status === "active"
+                                  ? "color-mix(in srgb, var(--accent) 12%, transparent)"
+                                  : "color-mix(in srgb, var(--danger) 12%, transparent)",
+                              color:
+                                pos.status === "active" ? "var(--accent)" : "var(--danger)",
+                            }}
+                          >
                             {String(pos.status ?? "active").toUpperCase()}
                           </span>
                         </td>
-                        <td><strong>{Number(pos.principal_amount ?? 0).toFixed(2)} XLM</strong></td>
-                        <td style={{ color: "#22cf9d" }}>{Number(pos.earned_interest ?? 0).toFixed(4)} XLM</td>
+                        <td>
+                          <strong>
+                            {formatTokenBalance(Number(pos.principal_amount ?? 0))}
+                          </strong>
+                        </td>
+                        <td style={{ color: "var(--accent)" }}>
+                          {formatTokenBalance(Number(pos.earned_interest ?? 0))}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -221,64 +356,108 @@ export default async function LenderHomePage() {
 
           {p2pInvestments.length > 0 && (
             <article className="workspace-card workspace-card--full">
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.75rem" }}>
-                <h2 className="workspace-card-title" style={{ margin: 0 }}>Recent Direct P2P Loans</h2>
-                <Link href="/dashboard/lender/history" className="workspace-nav-link" style={{ fontSize: "0.83rem" }}>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  marginBottom: "0.75rem",
+                }}
+              >
+                <h2 className="workspace-card-title" style={{ margin: 0 }}>
+                  Recent Direct P2P Loans
+                </h2>
+                <Link
+                  href="/dashboard/lender/history"
+                  className="workspace-nav-link"
+                  style={{ fontSize: "0.83rem" }}
+                >
                   View history →
                 </Link>
               </div>
               <div className="workspace-table-wrap">
                 <table className="workspace-table">
                   <thead>
-                    <tr><th>Loan ID</th><th>Deployed</th><th>Status</th><th>Profit Earned</th><th>Verification</th></tr>
+                    <tr>
+                      <th>Loan ID</th>
+                      <th>Deployed</th>
+                      <th>Status</th>
+                      <th>Profit Earned</th>
+                      <th>Verification</th>
+                    </tr>
                   </thead>
                   <tbody>
                     {p2pInvestments.map((tx) => {
-                       let fundTxHash = "";
-                       try {
-                         const meta = JSON.parse(String(tx.metadata || "{}"));
-                         fundTxHash = meta.txHash ?? "";
-                       } catch {}
+                      const fundTxHash = metaString(tx.metadata, "txHash");
 
-                       // Find actual loan data
-                       const actualLoan = loanMap[String(tx.ref_id)];
-                       const rawStatus = actualLoan?.status ?? "processing";
+                      // Find actual loan data
+                      const actualLoan = loanMap[String(tx.ref_id)];
+                      const rawStatus: string = actualLoan?.status ?? "processing";
 
+                      const repaid = Number(actualLoan?.repaid_amount ?? 0);
+                      const profit = Math.max(0, repaid - Number(tx.amount));
+                      const isRepaid = rawStatus === "repaid";
+                      const isDefaulted = rawStatus === "defaulted";
+                      const isProcessing = rawStatus === "processing";
+                      const stColor = isRepaid
+                        ? "var(--primary-muted)"
+                        : isDefaulted
+                          ? "var(--danger)"
+                          : isProcessing
+                            ? "var(--fg-muted)"
+                            : "var(--accent)";
+                      const stBg = isRepaid
+                        ? "color-mix(in srgb, var(--primary) 12%, transparent)"
+                        : isDefaulted
+                          ? "color-mix(in srgb, var(--danger) 12%, transparent)"
+                          : isProcessing
+                            ? "color-mix(in srgb, var(--fg-muted) 12%, transparent)"
+                            : "color-mix(in srgb, var(--accent) 12%, transparent)";
 
-                       const repaid = Number(actualLoan?.repaid_amount ?? 0);
-                       const profit = Math.max(0, repaid - Number(tx.amount));
-                       const isRepaid = rawStatus === "repaid";
-                       const isDefaulted = rawStatus === "defaulted";
-                       const isProcessing = rawStatus === "processing";
-                       const stColor = isRepaid
-                         ? "#9b6fe0"
-                         : isDefaulted
-                           ? "#ff6b6b"
-                           : isProcessing
-                             ? "#6b7280"
-                             : "#22cf9d";
-                       const stBg = isRepaid
-                         ? "rgba(155,111,224,0.12)"
-                         : isDefaulted
-                           ? "rgba(255,107,107,0.12)"
-                           : isProcessing
-                             ? "rgba(107,114,128,0.12)"
-                             : "rgba(34,207,157,0.12)";
+                      // Use repayment hash if it's repaid, otherwise fallback to funding hash
+                      const finalTxHash =
+                        isRepaid && repayMap[String(tx.ref_id)]
+                          ? repayMap[String(tx.ref_id)]
+                          : fundTxHash;
 
-                       // Use repayment hash if it's repaid, otherwise fallback to funding hash
-                       const finalTxHash = (isRepaid && repayMap[String(tx.ref_id)]) ? repayMap[String(tx.ref_id)] : fundTxHash;
-
-                       return (
+                      return (
                         <tr key={String(tx.id)}>
-                          <td style={{ fontFamily: "monospace", fontSize: "0.82rem" }}>{String(tx.ref_id).slice(0, 8)}</td>
-                          <td><strong>{Number(tx.amount ?? 0).toFixed(2)} XLM</strong></td>
+                          <td
+                            style={{
+                              fontFamily: "monospace",
+                              fontSize: "0.82rem",
+                            }}
+                          >
+                            {String(tx.ref_id).slice(0, 8)}
+                          </td>
                           <td>
-                            <span style={{ padding: "0.15rem 0.5rem", borderRadius: "9999px", fontSize: "0.75rem", fontWeight: 600, background: stBg, color: stColor }}>
+                            <strong>
+                              {formatTokenBalance(Number(tx.amount ?? 0))}
+                            </strong>
+                          </td>
+                          <td>
+                            <span
+                              style={{
+                                padding: "0.15rem 0.5rem",
+                                borderRadius: "9999px",
+                                fontSize: "0.75rem",
+                                fontWeight: 600,
+                                background: stBg,
+                                color: stColor,
+                              }}
+                            >
                               {String(rawStatus).toUpperCase()}
                             </span>
                           </td>
-                          <td style={{ color: profit > 0 ? "#22cf9d" : "#9ca3af", fontWeight: profit > 0 ? 700 : 400 }}>
-                            {profit > 0 ? `+${profit.toFixed(4)} XLM` : "0.00 XLM"}
+                          <td
+                            style={{
+                              color: profit > 0 ? "var(--accent)" : "var(--fg-subtle)",
+                              fontWeight: profit > 0 ? 700 : 400,
+                            }}
+                          >
+                            {profit > 0
+                              ? `+${profit.toFixed(4)} XLM`
+                              : "0.00 XLM"}
                           </td>
                           <td>
                             {finalTxHash ? (
@@ -287,17 +466,28 @@ export default async function LenderHomePage() {
                                 target="_blank"
                                 rel="noreferrer"
                                 style={{
-                                  display: "inline-flex", alignItems: "center", gap: "0.3rem",
-                                  padding: "0.25rem 0.6rem", borderRadius: "0.4rem",
-                                  background: "rgba(126,47,208,0.1)", border: "1px solid rgba(126,47,208,0.25)",
-                                  fontSize: "0.72rem", fontWeight: 700, color: "#7e2fd0",
-                                  textDecoration: "none", whiteSpace: "nowrap"
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: "0.3rem",
+                                  padding: "0.25rem 0.6rem",
+                                  borderRadius: "0.4rem",
+                                  background: "color-mix(in srgb, var(--primary) 10%, transparent)",
+                                  border: "1px solid color-mix(in srgb, var(--primary) 25%, transparent)",
+                                  fontSize: "0.72rem",
+                                  fontWeight: 700,
+                                  color: "var(--primary)",
+                                  textDecoration: "none",
+                                  whiteSpace: "nowrap",
                                 }}
                               >
                                 ✅ Verify {isRepaid ? "Repayment" : "Funding"} ↗
                               </a>
                             ) : (
-                              <span style={{ fontSize: "0.7rem", color: "#9ca3af" }}>Off-chain</span>
+                              <span
+                                style={{ fontSize: "0.7rem", color: "var(--fg-subtle)" }}
+                              >
+                                Off-chain
+                              </span>
                             )}
                           </td>
                         </tr>
@@ -312,17 +502,27 @@ export default async function LenderHomePage() {
 
         {/* ── KYC warning ─────────────────────────────────────────── */}
         {!isKycVerified && (
-          <article className="workspace-card workspace-card--full" style={{ border: "1px solid rgba(245,166,35,0.3)", background: "rgba(245,166,35,0.05)" }}>
+          <article
+            className="workspace-card workspace-card--full"
+            style={{
+              border: "1px solid color-mix(in srgb, var(--warning) 30%, transparent)",
+              background: "color-mix(in srgb, var(--warning) 5%, transparent)",
+            }}
+          >
             <h2 className="workspace-card-title">⚠️ KYC Not Verified</h2>
             <p className="workspace-card-copy">
-              Complete your KYC verification to unlock loan funding. Lenders must be verified before deploying capital.
+              Complete your KYC verification to unlock loan funding. Lenders
+              must be verified before deploying capital.
             </p>
-            <Link href="/dashboard/lender/profile" className="workspace-nav-link" style={{ display: "inline-block", marginTop: "0.75rem" }}>
+            <Link
+              href="/dashboard/lender/profile"
+              className="workspace-nav-link"
+              style={{ display: "inline-block", marginTop: "0.75rem" }}
+            >
               Complete KYC →
             </Link>
           </article>
         )}
-
       </div>
     </WorkspaceFrame>
   );

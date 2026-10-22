@@ -3,46 +3,27 @@ import { BorrowerForms } from "@/components/dashboard/BorrowerForms";
 import { requireAuthenticatedUser } from "@/lib/auth/session";
 import { getBorrowerDashboardMetrics, presentBorrowerMetrics } from "@/lib/dashboard/metrics";
 import { borrowerNavLinks } from "@/lib/dashboard/borrower-links";
-import { getServerSupabaseClient } from "@/lib/supabase/server";
+import { getDb } from "@/lib/db/client";
+import { getBorrowerLoans, getProfile } from "@/lib/db/queries";
+import { getFundingProgress } from "@/lib/loans/funding";
 
 export default async function BorrowerLoansPage() {
   const { user } = await requireAuthenticatedUser("borrower");
   const metrics  = await getBorrowerDashboardMetrics(user.id);
 
-  const supabase = await getServerSupabaseClient();
-  const [loansRes, profileRes] = supabase
-    ? await Promise.all([
-        supabase
-          .from("loans")
-          .select("id, status, principal_amount, apr_bps, duration_days, repaid_amount, due_at, created_at")
-          .eq("borrower_id", user.id)
-          .order("created_at", { ascending: false })
-          .limit(20),
-        supabase
-          .from("profiles")
-          .select("full_name, kyc_status")
-          .eq("id", user.id)
-          .maybeSingle(),
-      ])
-    : [{ data: [] }, { data: null }];
+  const db = getDb();
+  const [loans, profile] = await Promise.all([getBorrowerLoans(db, user.id, 20), getProfile(db, user.id)]);
 
-  const loans   = loansRes.data ?? [];
-  const profile = profileRes.data;
-
-  const loanIds = loans.map((l) => String(l.id));
-  const fundedLedgerRes = supabase && loanIds.length > 0
-    ? await supabase
-        .from("ledger_transactions")
-        .select("ref_id")
-        .eq("ref_type", "loan_fund")
-        .in("ref_id", loanIds)
-    : { data: [] };
-
-  const fundedLoanIds = new Set((fundedLedgerRes.data ?? []).map((row) => String(row.ref_id)));
+  // Funding progress drives the status shown to the borrower (Issue #269).
+  // A request is only "funded" once contributions cover the full principal —
+  // a partially filled loan stays "requested" and is NOT repayable yet.
   const normalizedLoans = loans.map((loan) => {
     const status = String(loan.status ?? "requested");
-    const effectiveStatus = status === "requested" && fundedLoanIds.has(String(loan.id)) ? "funded" : status;
-    return { ...loan, status: effectiveStatus };
+    const progress = getFundingProgress(loan.principal_amount, loan.funded_amount);
+    const effectiveStatus =
+      status === "requested" && progress.isFullyFunded ? "funded" : status;
+
+    return { ...loan, status: effectiveStatus, funded_amount: progress.funded };
   });
 
   const isKycVerified = profile?.kyc_status === "verified";
@@ -62,14 +43,14 @@ export default async function BorrowerLoansPage() {
       heading="Apply for a Loan"
       description="Submit a new loan request or make a repayment on your active loan."
       email={user.email ?? null}
-      userName={String(user.user_metadata?.full_name ?? profile?.full_name ?? "")}
+      userName={String(user.fullName ?? profile?.full_name ?? "")}
       metrics={presentBorrowerMetrics(metrics)}
       currentPath="/dashboard/borrower/loans"
       links={borrowerNavLinks}
     >
       <div className="workspace-stack">
         {!canApplyLoan && (
-          <article className="workspace-card workspace-card--full" style={{ background: "rgba(245,166,35,0.04)", borderColor: "rgba(245,166,35,0.25)" }}>
+          <article className="workspace-card workspace-card--full" style={{ background: "color-mix(in srgb, var(--warning) 4%, transparent)", borderColor: "color-mix(in srgb, var(--warning) 25%, transparent)" }}>
             <h2 className="workspace-card-title">⚠️ KYC Required</h2>
             <p className="workspace-card-copy" style={{ marginTop: "0.4rem" }}>
               Your KYC status is currently <strong>{profile?.kyc_status ?? "pending"}</strong>.{" "}
@@ -77,7 +58,7 @@ export default async function BorrowerLoansPage() {
                 ? "Your documents are under admin review. You'll be notified once approved."
                 : "Please complete your profile and submit government ID to apply for loans."}
             </p>
-            <a href="/dashboard/borrower/profile" style={{ display: "inline-block", marginTop: "0.75rem", fontSize: "0.82rem", color: "#7e2fd0", fontWeight: 600 }}>
+            <a href="/dashboard/borrower/profile" style={{ display: "inline-block", marginTop: "0.75rem", fontSize: "0.82rem", color: "var(--primary)", fontWeight: 600 }}>
               Go to Profile →
             </a>
           </article>
@@ -86,8 +67,8 @@ export default async function BorrowerLoansPage() {
         <BorrowerForms
           canApplyLoan={canApplyLoan}
           maxLoanAmount={maxLoanAmount}
-          loans={normalizedLoans as { id: string; status: string; due_at: string | null; principal_amount: number; repaid_amount: number; apr_bps?: number; duration_days?: number; created_at?: string | null; }[]}
-          selectedRepaymentLoan={repayableLoan as { id: string; status: string; due_at: string | null; principal_amount: number; repaid_amount: number } | null}
+          loans={normalizedLoans as unknown as { id: string; status: string; due_at: string | null; principal_amount: number; funded_amount?: number; repaid_amount: number; apr_bps?: number; duration_days?: number; created_at?: string | null; }[]}
+          selectedRepaymentLoan={repayableLoan as unknown as { id: string; status: string; due_at: string | null; principal_amount: number; repaid_amount: number } | null}
           dueAmount={dueAmount}
         />
       </div>

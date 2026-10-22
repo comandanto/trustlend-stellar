@@ -1,0 +1,24 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/payment-due",
+      "schedule": "0 0 * * *"
+    },
+    {
+      "path": "/api/cron/default-management",
+      "schedule": "0 2 * * *"
+    },
+    {
+      "path": "/api/cron/reputation-scoring",
+      "schedule": "0 3 * * *"
+    },
+    {
+      "path": "/api/cron/liquidation",
+      "schedule": "0 4 * * *"
+    },
+    {
+      "path": "/api/cron/price-oracle",
+      "schedule": "0 5 * * *"
+    }
+  ]
+}

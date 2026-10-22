@@ -1,11 +1,12 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Vec, BytesN};
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 /// Escrow hold status.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
 pub enum EscrowStatus {
     Held,
     Transferred,
@@ -37,6 +38,13 @@ pub enum DataKey {
     Hold(u32),
     EscrowCount,
     Admin,
+    MultisigAdmins,
+    MultisigThreshold,
+    IsPaused,
+    PauseSigner(Address),
+    PauseSignerCount,
+    UnpauseSigner(Address),
+    UnpauseSignerCount,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -54,6 +62,145 @@ impl EscrowContract {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::EscrowCount, &0u32);
+    }
+
+    /// Upgrade the contract's code while preserving its storage.
+    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) {
+        caller.require_auth();
+        Self::assert_admin(&env, &caller);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
+    /// Configure multi-sig admin set for pause/unpause.
+    pub fn setup_multisig(env: Env, admin: Address, admins: Vec<Address>, threshold: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+
+        if threshold == 0 {
+            panic!("Threshold must be at least 1");
+        }
+        if threshold > admins.len() {
+            panic!("Threshold exceeds number of admins");
+        }
+
+        let mut final_admins = admins;
+        if !final_admins.iter().any(|a| a == admin) {
+            final_admins.push_back(admin);
+        }
+
+        env.storage().instance().set(&DataKey::MultisigThreshold, &threshold);
+        env.storage().instance().set(&DataKey::MultisigAdmins, &final_admins);
+        env.storage().instance().set(&DataKey::IsPaused, &false);
+        env.storage().instance().set(&DataKey::PauseSignerCount, &0u32);
+        env.storage().instance().set(&DataKey::UnpauseSignerCount, &0u32);
+    }
+
+    pub fn pause(env: Env, caller: Address) {
+        caller.require_auth();
+        Self::assert_multisig_admin(&env, &caller);
+
+        let is_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::IsPaused)
+            .unwrap_or(false);
+        if is_paused {
+            panic!("Contract is already paused");
+        }
+
+        let signer_key = DataKey::PauseSigner(caller.clone());
+        if env.storage().instance().has(&signer_key) {
+            panic!("Signer has already authorised pause");
+        }
+        env.storage().instance().set(&signer_key, &true);
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseSignerCount)
+            .unwrap_or(0);
+        let new_count = count + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseSignerCount, &new_count);
+
+        let threshold: u32 = Self::get_multisig_threshold(env.clone());
+        if new_count >= threshold {
+            env.storage().instance().set(&DataKey::IsPaused, &true);
+            env.storage().instance().set(&DataKey::PauseSignerCount, &0u32);
+            env.events().publish(
+                (symbol_short!("escrow"), symbol_short!("paused")),
+                (),
+            );
+        }
+    }
+
+    pub fn unpause(env: Env, caller: Address) {
+        caller.require_auth();
+        Self::assert_multisig_admin(&env, &caller);
+
+        let is_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::IsPaused)
+            .unwrap_or(false);
+        if !is_paused {
+            panic!("Contract is not paused");
+        }
+
+        let signer_key = DataKey::UnpauseSigner(caller.clone());
+        if env.storage().instance().has(&signer_key) {
+            panic!("Signer has already authorised unpause");
+        }
+        env.storage().instance().set(&signer_key, &true);
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UnpauseSignerCount)
+            .unwrap_or(0);
+        let new_count = count + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::UnpauseSignerCount, &new_count);
+
+        let threshold: u32 = Self::get_multisig_threshold(env.clone());
+        if new_count >= threshold {
+            env.storage().instance().set(&DataKey::IsPaused, &false);
+            env.storage().instance().set(&DataKey::UnpauseSignerCount, &0u32);
+            env.events().publish(
+                (symbol_short!("escrow"), symbol_short!("unpaused")),
+                (),
+            );
+        }
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::IsPaused)
+            .unwrap_or(false)
+    }
+
+    pub fn get_multisig_admins(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultisigAdmins)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    pub fn get_multisig_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultisigThreshold)
+            .unwrap_or(1)
+    }
+
+    pub fn get_pause_signer_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PauseSignerCount)
+            .unwrap_or(0)
     }
 
     pub fn get_admin(env: Env) -> Address {
@@ -75,6 +222,7 @@ impl EscrowContract {
         amount: i128,
     ) -> u32 {
         lender.require_auth();
+        Self::assert_not_paused(&env);
 
         if amount <= 0 {
             panic!("Amount must be positive");
@@ -91,7 +239,7 @@ impl EscrowContract {
         let hold = EscrowHold {
             id: new_id,
             loan_id,
-            lender,
+            lender: lender.clone(),
             borrower,
             amount,
             held_at: now,
@@ -106,13 +254,19 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::EscrowCount, &new_id);
 
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("deposit")),
+            (lender, loan_id, amount),
+        );
+
         new_id
     }
 
     /// Returns true if the 3-minute revocation window is still open.
     pub fn is_within_revocation_window(env: Env, escrow_id: u32) -> bool {
-        let hold = Self::get_hold(env.clone(), escrow_id);
-        env.ledger().timestamp() < hold.expires_at
+        let now = env.ledger().timestamp();
+        let hold = Self::load_hold(&env, escrow_id);
+        now < hold.expires_at
     }
 
     /// Lender revokes before the 3-minute window closes.
@@ -121,7 +275,8 @@ impl EscrowContract {
     pub fn revoke_hold(env: Env, lender: Address, escrow_id: u32) {
         lender.require_auth();
 
-        let mut hold = Self::get_hold(env.clone(), escrow_id);
+        let now = env.ledger().timestamp();
+        let mut hold = Self::load_hold(&env, escrow_id);
 
         if hold.lender != lender {
             panic!("Only the lender can revoke");
@@ -129,7 +284,7 @@ impl EscrowContract {
         if hold.status != EscrowStatus::Held {
             panic!("Hold is not in HELD state");
         }
-        if env.ledger().timestamp() >= hold.expires_at {
+        if now >= hold.expires_at {
             panic!("Revocation window has expired");
         }
 
@@ -137,6 +292,11 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .set(&DataKey::Hold(escrow_id), &hold);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("withdraw")),
+            (lender, hold.loan_id, hold.amount),
+        );
     }
 
     /// Mark escrow as disbursed once the on-chain payment to the borrower
@@ -144,13 +304,15 @@ impl EscrowContract {
     pub fn confirm_disbursement(env: Env, caller: Address, escrow_id: u32) {
         caller.require_auth();
         Self::assert_admin(&env, &caller);
+        Self::assert_not_paused(&env);
 
-        let mut hold = Self::get_hold(env.clone(), escrow_id);
+        let now = env.ledger().timestamp();
+        let mut hold = Self::load_hold(&env, escrow_id);
 
         if hold.status != EscrowStatus::Held {
             panic!("Hold is not in HELD state");
         }
-        if env.ledger().timestamp() < hold.expires_at {
+        if now < hold.expires_at {
             panic!("Revocation window has not expired yet");
         }
 
@@ -158,6 +320,11 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .set(&DataKey::Hold(escrow_id), &hold);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("transfer")),
+            (escrow_id, hold.loan_id, hold.borrower, hold.amount),
+        );
     }
 
     /// Get escrow hold details.
@@ -178,6 +345,14 @@ impl EscrowContract {
     // ── Private helpers ───────────────────────────────────────────────────────
 
     fn assert_admin(env: &Env, caller: &Address) {
+        let multisig_admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigAdmins)
+            .unwrap_or(Vec::new(env));
+        if !multisig_admins.is_empty() && multisig_admins.iter().any(|a| a == *caller) {
+            return;
+        }
         let admin: Address = env
             .storage()
             .instance()
@@ -187,4 +362,39 @@ impl EscrowContract {
             panic!("Unauthorised: caller is not admin");
         }
     }
+
+    fn assert_multisig_admin(env: &Env, caller: &Address) {
+        let multisig_admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigAdmins)
+            .unwrap_or(Vec::new(env));
+        if multisig_admins.is_empty() {
+            panic!("Multisig not configured");
+        }
+        if !multisig_admins.iter().any(|a| a == *caller) {
+            panic!("Unauthorised: caller is not a multisig admin");
+        }
+    }
+
+    fn assert_not_paused(env: &Env) {
+        let is_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::IsPaused)
+            .unwrap_or(false);
+        if is_paused {
+            panic!("Contract is paused");
+        }
+    }
+
+    fn load_hold(env: &Env, escrow_id: u32) -> EscrowHold {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Hold(escrow_id))
+            .expect("Escrow hold not found")
+    }
 }
+
+#[cfg(test)]
+mod test;

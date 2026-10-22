@@ -8,10 +8,17 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [features]
+default = []
 testutils = ["soroban-sdk/testutils"]
+kani = []
 
 [dependencies]
-soroban-sdk = { workspace = true }
+# Transitive dependency versions are locked at the workspace level.
+soroban-sdk.workspace = true
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+borrower-loyalty = { path = "../borrower_loyalty" }
+borrower-reputation = { path = "../borrower_reputation" }
+referral-rewards = { path = "../referral_rewards" }

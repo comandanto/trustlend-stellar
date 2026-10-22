@@ -2,35 +2,42 @@
 
 import { Fragment, useState } from "react";
 import { DirectFundForm } from "./DirectFundForm";
+import { FundingProgressBar } from "@/components/ui/FundingProgressBar";
+import { TermTooltip } from "@/components/ui/TermTooltip";
+import { getFundingProgress } from "@/lib/loans/funding";
 
 interface MarketplaceLoan {
   id: string;
   principal_amount: number;
+  /** Total contributed by all lenders so far (Issue #269). */
+  funded_amount?: number;
+  /** Lenders who have already taken a slice of this loan. */
+  lender_count?: number;
   apr_bps: number;
   duration_days: number;
   trust_score: number;
   borrower_name: string;
   borrower_wallet: string;
+  onchain_loan_id?: number | null;
 }
 
 interface LoanMarketplaceProps {
   loans: MarketplaceLoan[];
   lenderWallet: string | null;
+  emptyStateTitle?: string;
+  emptyStateDescription?: string;
 }
 
 function TrustBadge({ score }: { score: number }) {
-  // TrustLend score range: 0-750
-  // Green  >= 200 : Good standing (default new users start at 250)
-  // Yellow >= 100 : Fair / limited history
-  // Red    < 100  : High risk / new with no history
   const color =
-    score >= 200 ? "#22cf9d" :
-    score >= 100 ? "#f5a623" :
-    "#ff6b6b";
+    score >= 200 ? "var(--accent)" :
+    score >= 100 ? "var(--warning)" :
+    "var(--danger)";
   const label =
-    score >= 200 ? "🟢" :
-    score >= 100 ? "🟡" :
-    "🔴";
+    score >= 200 ? "Good" :
+    score >= 100 ? "Fair" :
+    "Risk";
+
   return (
     <span
       title={`Trust score: ${score}/750`}
@@ -42,9 +49,9 @@ function TrustBadge({ score }: { score: number }) {
         borderRadius: "9999px",
         fontSize: "0.75rem",
         fontWeight: 700,
-        background: `${color}1a`,
+        background: `color-mix(in srgb, ${color} 10%, transparent)`,
         color,
-        border: `1px solid ${color}44`,
+        border: `1px solid color-mix(in srgb, ${color} 27%, transparent)`,
         whiteSpace: "nowrap",
       }}
     >
@@ -53,7 +60,12 @@ function TrustBadge({ score }: { score: number }) {
   );
 }
 
-export function LoanMarketplace({ loans, lenderWallet: _lenderWallet }: LoanMarketplaceProps) {
+export function LoanMarketplace({
+  loans,
+  lenderWallet: _lenderWallet,
+  emptyStateTitle = "All loans are funded!",
+  emptyStateDescription = "No open loan requests right now. Check back soon.",
+}: LoanMarketplaceProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   if (loans.length === 0) {
@@ -63,12 +75,12 @@ export function LoanMarketplace({ loans, lenderWallet: _lenderWallet }: LoanMark
           textAlign: "center",
           padding: "2rem",
           opacity: 0.55,
-          border: "1px dashed rgba(255,255,255,0.1)",
+          border: "1px dashed color-mix(in srgb, var(--fg) 10%, transparent)",
           borderRadius: "0.75rem",
         }}
       >
-        <p style={{ fontSize: "1.1rem", marginBottom: "0.5rem" }}>🎉 All loans are funded!</p>
-        <p style={{ fontSize: "0.85rem" }}>No open loan requests right now. Check back soon.</p>
+        <p style={{ fontSize: "1.1rem", marginBottom: "0.5rem" }}>{emptyStateTitle}</p>
+        <p style={{ fontSize: "0.85rem" }}>{emptyStateDescription}</p>
       </div>
     );
   }
@@ -80,52 +92,82 @@ export function LoanMarketplace({ loans, lenderWallet: _lenderWallet }: LoanMark
           <tr>
             <th>Loan ID</th>
             <th>Borrower</th>
-            <th>Trust Score</th>
+            <th>
+              <span className="term-tooltip">
+                Trust Score
+                <TermTooltip term="TRUST_SCORE" side="top" />
+              </span>
+            </th>
             <th>Amount</th>
-            <th>APR</th>
+            <th>Funding Progress</th>
+            <th>
+              <span className="term-tooltip">
+                APR
+                <TermTooltip term="APR" side="top" />
+              </span>
+            </th>
             <th>Duration</th>
-            <th>Est. Return</th>
+            <th>Est. Return (max)</th>
             <th>Action</th>
           </tr>
         </thead>
         <tbody>
           {loans.map((loan) => {
+            const progress = getFundingProgress(
+              loan.principal_amount,
+              loan.funded_amount ?? 0
+            );
+            // Estimated return is quoted on the slice still available, since
+            // that is the most a lender can take on this loan right now.
             const interestXlm = (
-              (loan.principal_amount * (loan.apr_bps / 10000) * loan.duration_days) / 365
+              (progress.remaining * (loan.apr_bps / 10000) * loan.duration_days) / 365
             ).toFixed(2);
             const isExpanded = expandedId === loan.id;
-            const hasWallet  = Boolean(loan.borrower_wallet);
+            const hasWallet = Boolean(loan.borrower_wallet);
 
-            // Fragment with key fixes the "Each child in a list" React warning.
-            // <> shorthand cannot accept a key prop.
             return (
               <Fragment key={loan.id}>
                 <tr
                   style={{
-                    background: isExpanded ? "rgba(126,47,208,0.06)" : undefined,
+                    background: isExpanded ? "color-mix(in srgb, var(--primary) 6%, transparent)" : undefined,
                     transition: "all 0.25s ease",
                     cursor: hasWallet ? "pointer" : "default",
                   }}
                   onClick={() => hasWallet && setExpandedId(isExpanded ? null : loan.id)}
                 >
-                  <td style={{ fontFamily: "monospace", fontSize: "0.82rem", color: "#666" }}>
+                  <td style={{ fontFamily: "monospace", fontSize: "0.82rem", color: "var(--fg-muted)" }}>
                     {loan.id.slice(0, 8)}
                   </td>
-                  <td style={{ fontWeight: 600, color: "#111" }}>{loan.borrower_name}</td>
+                  <td style={{ fontWeight: 600, color: "var(--fg)" }}>{loan.borrower_name}</td>
                   <td><TrustBadge score={loan.trust_score} /></td>
-                  <td><strong style={{ fontSize: "1rem", color: "#111" }}>{loan.principal_amount.toFixed(2)}</strong> <span style={{ fontSize: "0.75rem", opacity: 0.6, color: "#444" }}>XLM</span></td>
-                  <td style={{ fontWeight: 600, color: "#111" }}>{(loan.apr_bps / 100).toFixed(2)}%</td>
-                  <td style={{ color: "#444" }}>{loan.duration_days} days</td>
-                  <td style={{ color: "#22cf9d", fontWeight: 700 }}>
+                  <td>
+                    <strong style={{ fontSize: "1rem", color: "var(--fg)" }}>
+                      {loan.principal_amount.toFixed(2)}
+                    </strong>{" "}
+                    <span style={{ fontSize: "0.75rem", opacity: 0.6, color: "var(--fg)" }}>XLM</span>
+                  </td>
+                  <td>
+                    <FundingProgressBar
+                      principalAmount={loan.principal_amount}
+                      fundedAmount={loan.funded_amount ?? 0}
+                      lenderCount={loan.lender_count}
+                      compact
+                    />
+                  </td>
+                  <td style={{ fontWeight: 600, color: "var(--fg)" }}>
+                    {(loan.apr_bps / 100).toFixed(2)}%
+                  </td>
+                  <td style={{ color: "var(--fg)" }}>{loan.duration_days} days</td>
+                  <td style={{ color: "var(--accent)", fontWeight: 700 }}>
                     +{interestXlm} <span style={{ fontSize: "0.7rem", opacity: 0.8 }}>XLM</span>
                   </td>
                   <td>
                     {!hasWallet ? (
                       <span
-                        style={{ fontSize: "0.75rem", color: "#ff9966", opacity: 0.9, fontWeight: 600 }}
+                        style={{ fontSize: "0.75rem", color: "var(--warning)", opacity: 0.9, fontWeight: 600 }}
                         title="Borrower has not connected a Stellar wallet yet"
                       >
-                        ⚠ No wallet
+                        No wallet
                       </span>
                     ) : (
                       <button
@@ -137,33 +179,39 @@ export function LoanMarketplace({ loans, lenderWallet: _lenderWallet }: LoanMark
                           whiteSpace: "nowrap",
                         }}
                       >
-                        {isExpanded ? "Close" : "Fund →"}
+                        {isExpanded
+                          ? "Close"
+                          : progress.isPartiallyFunded
+                            ? "Top up ->"
+                            : "Fund ->"}
                       </button>
                     )}
                   </td>
                 </tr>
 
-                {/* Inline funding form row */}
                 {isExpanded && (
                   <tr>
-                    <td 
-                      colSpan={8} 
-                      style={{ 
-                        padding: "1.5rem 1rem", 
-                        background: "#fafafa",
-                        borderBottom: "1px solid rgba(126, 47, 208, 0.15)",
-                        borderTop: "1px solid rgba(126, 47, 208, 0.1)",
+                    <td
+                      colSpan={9}
+                      style={{
+                        padding: "1.5rem 1rem",
+                        background: "var(--surface-2)",
+                        borderBottom: "1px solid color-mix(in srgb, var(--primary) 15%, transparent)",
+                        borderTop: "1px solid color-mix(in srgb, var(--primary) 10%, transparent)",
                       }}
                     >
                       <div style={{ animation: "fadeInUp 0.3s ease-out" }}>
                         <DirectFundForm
                           loan={{
-                            id:               loan.id,
+                            id: loan.id,
                             principal_amount: loan.principal_amount,
-                            apr_bps:          loan.apr_bps,
-                            duration_days:    loan.duration_days,
-                            trust_score:      loan.trust_score,
-                            borrower_wallet:  loan.borrower_wallet,
+                            funded_amount: loan.funded_amount ?? 0,
+                            lender_count: loan.lender_count,
+                            apr_bps: loan.apr_bps,
+                            duration_days: loan.duration_days,
+                            trust_score: loan.trust_score,
+                            borrower_wallet: loan.borrower_wallet,
+                            onchain_loan_id: loan.onchain_loan_id ?? null,
                           }}
                           onClose={() => setExpandedId(null)}
                         />

@@ -2,30 +2,33 @@ import { WorkspaceFrame } from "@/components/dashboard/WorkspaceFrame";
 import { adminNavLinks } from "@/lib/dashboard/admin-links";
 import { requireTradeVaultAdmin } from "@/lib/auth/session";
 import { getAdminDashboardMetrics, presentAdminMetrics } from "@/lib/dashboard/metrics";
-import { getServiceRoleClient } from "@/lib/supabase/server";
+import { getDb } from "@/lib/db/client";
+import { fetchAdminDashboardPools } from "@/lib/db/pools";
 import AdminPoolsClient from "./pools-client";
 
+/**
+ * Admin Pools Page
+ * 
+ * OPTIMIZATION (Issue #39):
+ * - Uses fetchAdminDashboardPools from lib/db/pools.ts
+ * - Parallel queries instead of waterfall
+ * - Explicit column selection (no SELECT *)
+ * - Consistent type handling
+ */
 export default async function AdminPoolsPage() {
   const { user } = await requireTradeVaultAdmin();
   const metrics = await getAdminDashboardMetrics();
-  const admin = getServiceRoleClient();
+  const db = getDb();
 
-  const [poolsRes, pendingLoansRes] = admin
-    ? await Promise.all([
-        admin
-          .from("lending_pools")
-          .select("id, name, description, status, apr_bps, total_liquidity, available_liquidity")
-          .order("created_at", { ascending: false }),
-        admin
-          .from("loans")
-          .select("id, status, principal_amount, apr_bps, duration_days, requested_at, borrower_id, profiles:borrower_id(full_name)")
-          .eq("status", "requested")
-          .order("requested_at", { ascending: true }),
-      ])
-    : [{ data: [] }, { data: [] }];
+  if (!db) {
+    throw new Error("Database service unavailable");
+  }
 
+  // Pools and pending loans are fetched in parallel.
+  const { pools: rawPools, pendingLoans: rawLoans } = await fetchAdminDashboardPools(db);
 
-  const pools = (poolsRes.data ?? []).map((p) => ({
+  // Transform to component-friendly format
+  const pools = rawPools.map((p) => ({
     id: String(p.id),
     name: String(p.name ?? ""),
     description: p.description ? String(p.description) : null,
@@ -33,26 +36,20 @@ export default async function AdminPoolsPage() {
     apr_bps: Number(p.apr_bps ?? 0),
     total_liquidity: Number(p.total_liquidity ?? 0),
     available_liquidity: Number(p.available_liquidity ?? 0),
+    borrow_cap: p.borrow_cap ?? null,
   }));
 
-  const pendingLoans = (pendingLoansRes.data ?? []).map((l) => {
-    // Supabase returns joined relations as array or object depending on cardinality
-    const raw = l.profiles;
-    const profileData = Array.isArray(raw)
-      ? (raw[0] as { full_name: string | null } | undefined) ?? null
-      : (raw as { full_name: string | null } | null);
-    return {
-      id: String(l.id),
-      status: String(l.status ?? "requested"),
-      principal_amount: Number(l.principal_amount ?? 0),
-      apr_bps: Number(l.apr_bps ?? 0),
-      duration_days: Number(l.duration_days ?? 30),
-      requested_at: String(l.requested_at ?? ""),
-      borrower_profile: profileData
-        ? { full_name: profileData.full_name ?? null }
-        : null,
-    };
-  });
+  const pendingLoans = rawLoans.map((l) => ({
+    id: String(l.id),
+    status: String(l.status ?? "requested"),
+    principal_amount: Number(l.principal_amount ?? 0),
+    apr_bps: Number(l.apr_bps ?? 0),
+    duration_days: Number(l.duration_days ?? 30),
+    requested_at: String(l.requested_at ?? ""),
+    borrower_profile: l.borrower_profile
+      ? { full_name: l.borrower_profile.full_name ?? null }
+      : null,
+  }));
 
   return (
     <WorkspaceFrame
@@ -60,7 +57,7 @@ export default async function AdminPoolsPage() {
       heading="Pool Management"
       description="Create lending pools, approve borrower loans, and run auto-matching to deploy capital efficiently."
       email={user.email ?? null}
-      userName={String(user.user_metadata?.full_name ?? "Admin")}
+      userName={String(user.fullName ?? "Admin")}
       metrics={presentAdminMetrics(metrics)}
       links={[
         ...adminNavLinks,

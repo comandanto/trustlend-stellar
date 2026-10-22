@@ -1,7 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuthenticatedUser } from "@/lib/auth/session";
-import { getServerSupabaseClient } from "@/lib/supabase/server";
+import { enforceRouteRateLimit } from "@/lib/rate-limit";
+import { and, eq, sql } from "drizzle-orm";
+import { getDb } from "@/lib/db/client";
+import { ledgerTransactions, lendingPools, poolPositions, profiles } from "@/lib/db/schema";
+import { requireKycVerified } from "@/lib/kyc/middleware";
+import { syncPoolOnchain } from "@/lib/pools/onchain";
+import { platformWalletAddress } from "@/lib/stellar/platform-wallet";
+import { PAYMENT_MEMO, verifyPaymentTransaction } from "@/lib/stellar/verify-payment";
 import { isRedirectError } from "next/dist/client/components/redirect-error";
+import { isBoundedString } from "@/lib/http/request-validation";
 
 /**
  * POST /api/pools/deposit
@@ -9,19 +17,33 @@ import { isRedirectError } from "next/dist/client/components/redirect-error";
  * Body: { poolId, amount, txHash, lenderAddress }
  *
  * Flow:
- *   1. Lender signs a real Stellar payment tx in Freighter (client-side)
+ *   1. Lender signs a real Stellar payment to the platform wallet (client-side)
  *   2. Client passes the confirmed tx hash here
- *   3. We verify the tx hash is non-empty, then record the position
- *
- * Using direct supabase.auth.getUser() to return JSON on auth failure
- * instead of calling requireAuthenticatedUser which redirect()s → 307 HTML.
+ *   3. The payment is verified against Horizon (signed by the lender's wallet,
+ *      memo bound to this pool, `amount` XLM delivered to the platform wallet)
+ *   4. The position and pool liquidity are recorded, then mirrored to the
+ *      PooledLendingContract
  */
 export async function POST(request: NextRequest) {
   try {
+    const rateLimitResponse = await enforceRouteRateLimit(request);
+    if (rateLimitResponse) {
+      return rateLimitResponse;
+    }
+
     const { user } = await requireAuthenticatedUser("lender");
-    const supabase = await getServerSupabaseClient();
-    if (!supabase) {
+    const db = getDb();
+    if (!db) {
       return NextResponse.json({ error: "Database unavailable" }, { status: 503 });
+    }
+
+    // ── KYC guard: regulated pool deposits require verified identity ────────
+    const kycCheck = await requireKycVerified(user.id, db, { regulatedPoolOnly: true });
+    if (!kycCheck.allowed) {
+      return NextResponse.json(
+        { error: kycCheck.reason, kycStatus: kycCheck.kycStatus },
+        { status: 403 }
+      );
     }
 
     const body = await request.json();
@@ -32,7 +54,7 @@ export async function POST(request: NextRequest) {
       lenderAddress?: string;
     };
 
-    if (!poolId || !amount || amount <= 0 || !Number.isFinite(amount)) {
+    if (!isBoundedString(poolId, 128) || !amount || amount <= 0 || !Number.isFinite(amount)) {
       return NextResponse.json({ error: "Invalid request" }, { status: 400 });
     }
     if (amount > 1_000_000) {
@@ -40,7 +62,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Require a real Stellar tx hash — no ghost deposits
-    if (!txHash || txHash.trim().length < 10) {
+    if (!isBoundedString(txHash, 128) || !isBoundedString(lenderAddress, 128)) {
       return NextResponse.json(
         { error: "A confirmed Stellar transaction hash is required" },
         { status: 400 }
@@ -48,11 +70,11 @@ export async function POST(request: NextRequest) {
     }
 
     // Prevent duplicate recording of the same tx
-    const { data: existingTx } = await supabase
-      .from("ledger_transactions")
-      .select("id")
-      .eq("metadata->>txHash", txHash)
-      .maybeSingle();
+    const [existingTx] = await db
+      .select({ id: ledgerTransactions.id })
+      .from(ledgerTransactions)
+      .where(sql`${ledgerTransactions.metadata}->>'txHash' = ${txHash}`)
+      .limit(1);
 
     if (existingTx) {
       return NextResponse.json(
@@ -62,89 +84,107 @@ export async function POST(request: NextRequest) {
     }
 
     // Verify pool exists and is active
-    const { data: pool, error: poolError } = await supabase
-      .from("lending_pools")
-      .select("id, status, total_liquidity, available_liquidity")
-      .eq("id", poolId)
-      .eq("status", "active")
-      .single();
+    const [pool] = await db
+      .select({ id: lendingPools.id })
+      .from(lendingPools)
+      .where(and(eq(lendingPools.id, poolId), eq(lendingPools.status, "active")))
+      .limit(1);
 
-    if (poolError || !pool) {
+    if (!pool) {
       return NextResponse.json({ error: "Pool not found or inactive" }, { status: 404 });
     }
 
+    // ── Verify the payment on-chain before crediting anything ────────────────
+    const platformWallet = platformWalletAddress();
+    if (!platformWallet) {
+      return NextResponse.json(
+        { error: "Pool deposits are not configured (NEXT_PUBLIC_PLATFORM_STELLAR_ADDRESS is missing)" },
+        { status: 503 }
+      );
+    }
+
+    const [lenderProfile] = await db
+      .select({ walletAddress: profiles.walletAddress })
+      .from(profiles)
+      .where(eq(profiles.id, user.id))
+      .limit(1);
+    const lenderWallets = new Set(
+      [user.walletAddress, lenderProfile?.walletAddress].filter(
+        (w): w is string => typeof w === "string" && w.length > 0
+      )
+    );
+    if (!lenderAddress || !lenderWallets.has(lenderAddress)) {
+      return NextResponse.json(
+        { error: "lenderAddress does not match a wallet linked to your account" },
+        { status: 400 }
+      );
+    }
+
+    const verification = await verifyPaymentTransaction({
+      txHash,
+      expectedSource: lenderAddress,
+      expectedMemo: PAYMENT_MEMO.deposit(poolId),
+      expectedPayments: [{ destination: platformWallet, minAmount: amount }],
+    });
+    if (!verification.ok) {
+      return NextResponse.json(
+        { error: `Payment verification failed: ${verification.reason}` },
+        { status: verification.status }
+      );
+    }
+
     // Upsert pool position (add to existing or create new)
-    const { data: existingPosition } = await supabase
-      .from("pool_positions")
-      .select("id, principal_amount")
-      .eq("pool_id", poolId)
-      .eq("lender_id", user.id)
-      .eq("status", "active")
-      .maybeSingle();
+    const [existingPosition] = await db
+      .select({ id: poolPositions.id })
+      .from(poolPositions)
+      .where(
+        and(eq(poolPositions.poolId, poolId), eq(poolPositions.lenderId, user.id), eq(poolPositions.status, "active")),
+      )
+      .limit(1);
 
     let position;
     if (existingPosition) {
-      const { data: updated, error: updateError } = await supabase
-        .from("pool_positions")
-        .update({
-          principal_amount: Number(existingPosition.principal_amount ?? 0) + amount,
-        })
-        .eq("id", existingPosition.id)
-        .select()
-        .single();
-
-      if (updateError) return NextResponse.json({ error: updateError.message }, { status: 500 });
-      position = updated;
+      [position] = await db
+        .update(poolPositions)
+        .set({ principalAmount: sql`${poolPositions.principalAmount} + ${amount}` })
+        .where(eq(poolPositions.id, existingPosition.id))
+        .returning();
     } else {
-      const { data: newPosition, error: insertError } = await supabase
-        .from("pool_positions")
-        .insert({
-          pool_id: poolId,
-          lender_id: user.id,
-          principal_amount: amount,
-          status: "active",
-          opened_at: new Date().toISOString(),
-        })
-        .select()
-        .single();
-
-      if (insertError) return NextResponse.json({ error: insertError.message }, { status: 500 });
-      position = newPosition;
+      [position] = await db
+        .insert(poolPositions)
+        .values({ poolId, lenderId: user.id, principalAmount: String(amount), status: "active" })
+        .returning();
     }
 
-    // Update pool liquidity atomically
-    const { error: poolUpdateError } = await supabase
-      .from("lending_pools")
-      .update({
-        total_liquidity: Number(pool.total_liquidity ?? 0) + amount,
-        available_liquidity: Number(pool.available_liquidity ?? 0) + amount,
+    // Update pool liquidity atomically (SQL-side increment, no read-modify-write race)
+    await db
+      .update(lendingPools)
+      .set({
+        totalLiquidity: sql`${lendingPools.totalLiquidity} + ${amount}`,
+        availableLiquidity: sql`${lendingPools.availableLiquidity} + ${amount}`,
       })
-      .eq("id", poolId);
-
-    if (poolUpdateError) {
-      return NextResponse.json({ error: poolUpdateError.message }, { status: 500 });
-    }
+      .where(eq(lendingPools.id, poolId));
 
     // Record ledger entry with tx hash for on-chain verification
-    await supabase.from("ledger_transactions").insert({
-      user_id: user.id,
+    await db.insert(ledgerTransactions).values({
+      userId: user.id,
       category: "deposit",
-      amount,
+      amount: String(amount),
       currency: "XLM",
       status: "confirmed",
-      ref_type: "pool_position",
-      ref_id: position.id,
-      metadata: JSON.stringify({
-        txHash,
-        lenderAddress: lenderAddress ?? null,
-        poolId,
-      }),
+      refType: "pool_position",
+      refId: position.id,
+      metadata: { txHash, lenderAddress, poolId, verifiedLedger: verification.ledger },
     });
+
+    // ── Mirror pool totals to the PooledLendingContract ──────────────────────
+    const onchain = await syncPoolOnchain(db, poolId);
 
     return NextResponse.json(
       {
         position,
         txHash,
+        onchain,
         explorerUrl: `https://stellar.expert/explorer/testnet/tx/${txHash}`,
       },
       { status: 201 }

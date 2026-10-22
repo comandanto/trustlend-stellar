@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSupabaseClient } from "@/lib/supabase/server";
+import { enforceRouteRateLimit } from "@/lib/rate-limit";
+import { and, eq } from "drizzle-orm";
+import { getSessionUser } from "@/lib/auth/session";
+import { getDb } from "@/lib/db/client";
+import { reputationEvents } from "@/lib/db/schema";
 
 /**
  * POST /api/tasks/complete
@@ -9,12 +13,17 @@ import { getServerSupabaseClient } from "@/lib/supabase/server";
  */
 export async function POST(request: NextRequest) {
   try {
-    const supabase = await getServerSupabaseClient();
-    if (!supabase) {
+    const rateLimitResponse = await enforceRouteRateLimit(request);
+    if (rateLimitResponse) {
+      return rateLimitResponse;
+    }
+
+    const db = getDb();
+    if (!db) {
       return NextResponse.json({ error: "Database unavailable" }, { status: 503 });
     }
 
-    const { data: { user } } = await supabase.auth.getUser();
+    const user = await getSessionUser();
     if (!user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
@@ -31,17 +40,36 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Task not found" }, { status: 404 });
     }
 
-    const { data: awardedPoints, error: rpcErr } = await supabase.rpc("complete_platform_task", {
-      p_task_id: taskId,
-    });
+    // Each task can only be claimed once per user.
+    const [existing] = await db
+      .select({ id: reputationEvents.id })
+      .from(reputationEvents)
+      .where(
+        and(
+          eq(reputationEvents.userId, user.id),
+          eq(reputationEvents.sourceType, "task_completion"),
+          eq(reputationEvents.sourceKey, taskId),
+        ),
+      )
+      .limit(1);
 
-    if (rpcErr) {
-      const message = rpcErr.message || "Failed to complete task.";
-      const status = /already completed/i.test(message) ? 409 : 500;
-      return NextResponse.json({ error: message }, { status });
+    if (existing) {
+      return NextResponse.json(
+        { error: "Task already completed. Each task can only be claimed once." },
+        { status: 409 },
+      );
     }
 
-    const pointsAwarded = Number(awardedPoints ?? task.points);
+    // The reputation_snapshots trigger folds this into the user's score.
+    await db.insert(reputationEvents).values({
+      userId: user.id,
+      sourceType: "task_completion",
+      sourceKey: taskId,
+      pointsDelta: task.points,
+      reason: `Completed: ${task.title}`,
+    });
+
+    const pointsAwarded = task.points;
 
     return NextResponse.json({
       taskId,

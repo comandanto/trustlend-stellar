@@ -1,6 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuthenticatedUser } from "@/lib/auth/session";
-import { getServerSupabaseClient, getServiceRoleClient } from "@/lib/supabase/server";
+import { enforceRouteRateLimit } from "@/lib/rate-limit";
+import { and, eq, sql } from "drizzle-orm";
+import { getDb } from "@/lib/db/client";
+import { ledgerTransactions, loanRepayments, loans, profiles, reputationEvents } from "@/lib/db/schema";
+import { getLoanLenders } from "@/lib/loans/lenders";
+import { splitRepaymentAcrossLenders } from "@/lib/loans/funding";
+import { recordRepaymentOnchain } from "@/lib/loans/onchain";
+import { getPlatformFeeBps, resolveLoanFeeBps } from "@/lib/platform/settings";
+import { PAYMENT_MEMO, verifyPaymentTransaction } from "@/lib/stellar/verify-payment";
 import { isRedirectError } from "next/dist/client/components/redirect-error";
 
 interface RepayPayload {
@@ -10,8 +18,23 @@ interface RepayPayload {
   borrowerAddress: string;
 }
 
+/**
+ * POST /api/loans/repay
+ *
+ * The borrower's wallet pays each lender their pro-rata share plus the
+ * platform fee in one classic transaction (see BorrowerRepayWidget). Before
+ * anything is written the payment is verified against Horizon: signed by the
+ * borrower's wallet, memo bound to this loan, the whole `amount` delivered to
+ * the lenders' and platform wallets and nowhere else. The repayment is then
+ * mirrored to the LendingContract with `record_payment`.
+ */
 export async function POST(request: NextRequest) {
   try {
+    const rateLimitResponse = await enforceRouteRateLimit(request);
+    if (rateLimitResponse) {
+      return rateLimitResponse;
+    }
+
     const { user } = await requireAuthenticatedUser("borrower");
     const { loanId, amount, txHash, borrowerAddress } = (await request.json()) as RepayPayload;
 
@@ -22,66 +45,119 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "A confirmed Stellar transaction hash is required for on-chain repayment" }, { status: 400 });
     }
 
-    const supabase = await getServerSupabaseClient();
-    const srClient = getServiceRoleClient();
-    if (!supabase || !srClient) {
+    const db = getDb();
+    if (!db) {
       return NextResponse.json({ error: "Database unavailable" }, { status: 500 });
     }
 
     // Double-check borrower & loan
-    const { data: loan, error: loanError } = await supabase
-      .from("loans")
-      .select("id, borrower_id, status, repaid_amount, principal_amount, apr_bps, duration_days")
-      .eq("id", loanId)
-      .eq("borrower_id", user.id)
-      .single();
+    const [loanRow] = await db
+      .select({
+        id: loans.id,
+        status: loans.status,
+        repaidAmount: loans.repaidAmount,
+        principalAmount: loans.principalAmount,
+        aprBps: loans.aprBps,
+        durationDays: loans.durationDays,
+        metadata: loans.metadata,
+        borrowerWallet: profiles.walletAddress,
+      })
+      .from(loans)
+      .leftJoin(profiles, eq(profiles.id, loans.borrowerId))
+      .where(and(eq(loans.id, loanId), eq(loans.borrowerId, user.id)))
+      .limit(1);
 
-    if (loanError || !loan) return NextResponse.json({ error: "Loan not found" }, { status: 404 });
+    if (!loanRow) return NextResponse.json({ error: "Loan not found" }, { status: 404 });
+    const loan = {
+      id: loanRow.id,
+      status: loanRow.status as string,
+      repaid_amount: Number(loanRow.repaidAmount),
+      principal_amount: Number(loanRow.principalAmount),
+      apr_bps: loanRow.aprBps,
+      duration_days: loanRow.durationDays,
+      metadata: loanRow.metadata,
+      borrower_wallet: String(loanRow.borrowerWallet ?? ""),
+    };
     if (loan.status === "repaid") return NextResponse.json({ error: "Loan is already fully repaid" }, { status: 400 });
     if (loan.status === "defaulted") return NextResponse.json({ error: "Loan is in default" }, { status: 400 });
 
     // Prevent duplicate txHash
-    const { data: existingTx } = await srClient
-      .from("ledger_transactions")
-      .select("id")
-      .eq("ref_type", "loan_repay")
-      .ilike("metadata->>txHash", txHash) // check if JSON contains this hash
-      .maybeSingle();
+    const [existingTx] = await db
+      .select({ id: ledgerTransactions.id })
+      .from(ledgerTransactions)
+      .where(
+        and(
+          eq(ledgerTransactions.refType, "loan_repay"),
+          sql`lower(${ledgerTransactions.metadata}->>'txHash') = lower(${txHash})`,
+        ),
+      )
+      .limit(1);
 
     if (existingTx) {
       return NextResponse.json({ error: "This transaction hash has already been recorded" }, { status: 409 });
     }
 
-    // Figure out the lender to notify them
-    const { data: fundTx } = await srClient
-      .from("ledger_transactions")
-      .select("user_id, metadata")
-      .eq("ref_type", "loan_fund")
-      .eq("ref_id", loanId)
-      .maybeSingle();
-      
-    const lenderUserId = fundTx?.user_id || "";
-    let lenderAddress = "";
-    if (fundTx && fundTx.metadata) {
-       try {
-         const meta = typeof fundTx.metadata === "string" ? JSON.parse(fundTx.metadata) : fundTx.metadata;
-         lenderAddress = meta.lenderAddress ?? "";
-       } catch { /* ignore */ }
+    // Figure out every lender to notify. A loan can be funded by several
+    // lenders (Issue #269), each owed a pro-rata slice of this repayment.
+    const lenders = await getLoanLenders(db, loanId);
+    const primaryLender = lenders[0];
+    const lenderUserId = primaryLender?.lenderId ?? "";
+    const lenderAddress = primaryLender?.address ?? "";
+    const lenderPayouts = splitRepaymentAcrossLenders(amount, lenders);
+
+    // ── Verify the repayment on-chain before crediting it ────────────────────
+    // The borrower may only pay from the wallet they signed in with or the one
+    // saved on their profile; the client-supplied address is just a claim.
+    const borrowerWallets = new Set(
+      [user.walletAddress, loan.borrower_wallet].filter((w) => typeof w === "string" && w.length > 0)
+    );
+    if (!borrowerWallets.has(String(borrowerAddress ?? ""))) {
+      return NextResponse.json(
+        { error: "borrowerAddress does not match a wallet linked to your account" },
+        { status: 400 }
+      );
+    }
+
+    const platformWallet = process.env.PLATFORM_FEE_WALLET ?? "";
+    const allowedDestinations = [
+      ...lenders.map((l) => l.address).filter((a) => a.length > 0),
+      ...(platformWallet ? [platformWallet] : []),
+    ];
+    if (allowedDestinations.length === 0) {
+      return NextResponse.json(
+        { error: "No lender wallet is recorded for this loan, so the repayment cannot be verified" },
+        { status: 409 }
+      );
+    }
+
+    const verification = await verifyPaymentTransaction({
+      txHash,
+      expectedSource: String(borrowerAddress),
+      expectedMemo: PAYMENT_MEMO.repay(loanId),
+      // Each lender's share is checked in aggregate: the whole amount must
+      // have landed across the lenders + platform wallet and nowhere else.
+      expectedPayments: allowedDestinations.map((destination) => ({ destination, minAmount: 0 })),
+    });
+    if (!verification.ok) {
+      return NextResponse.json(
+        { error: `Payment verification failed: ${verification.reason}` },
+        { status: verification.status }
+      );
+    }
+    if (verification.totalNative + 0.0000001 < amount) {
+      return NextResponse.json(
+        {
+          error: `Payment verification failed: transaction moved ${verification.totalNative.toFixed(7)} XLM but ${amount} XLM was claimed`,
+        },
+        { status: 422 }
+      );
     }
 
     // Create repayment record in DB
-    const { data: repayment, error: repaymentError } = await srClient
-      .from("loan_repayments")
-      .insert({
-        loan_id: loanId,
-        payer_id: user.id,
-        amount: amount,
-        tx_ref: txHash,
-      })
-      .select()
-      .single();
-
-    if (repaymentError) return NextResponse.json({ error: repaymentError.message }, { status: 500 });
+    const [repayment] = await db
+      .insert(loanRepayments)
+      .values({ loanId, payerId: user.id, amount: String(amount), txRef: txHash })
+      .returning();
 
     // Calculate updated balances
     const newRepaidAmount = (loan.repaid_amount || 0) + amount;
@@ -91,7 +167,17 @@ export async function POST(request: NextRequest) {
     const durationDays = Number(loan.duration_days ?? 30);
     const aprBps       = Number(loan.apr_bps ?? 0);
     const totalInterest= principal * (aprBps / 10000) * (durationDays / 365);
-    const platformFee  = principal * 0.01;
+    // The platform fee is admin-configurable (issue #324) but locked per loan:
+    // `resolveLoanFeeBps` prefers the rate stamped at origination, so raising
+    // the fee never increases what an outstanding loan owes. Only loans created
+    // before that stamp existed fall through to the live setting.
+    const activeFeeSetting = await getPlatformFeeBps(db);
+    const resolvedFee  = resolveLoanFeeBps({
+      principal,
+      loanMetadata: loan.metadata,
+      activeSetting: activeFeeSetting,
+    });
+    const platformFee  = resolvedFee.feeAmount;
     const totalDue     = principal + totalInterest + platformFee;
 
     let newStatus = loan.status === "funded" ? "active" : loan.status;
@@ -102,46 +188,67 @@ export async function POST(request: NextRequest) {
       newStatus = "active";
     }
 
-    const { error: updateError } = await srClient
-      .from("loans")
-      .update({
-        repaid_amount: newRepaidAmount,
-        status: newStatus,
+    await db
+      .update(loans)
+      .set({
+        repaidAmount: String(newRepaidAmount),
+        status: newStatus as typeof loans.$inferInsert.status,
       })
-      .eq("id", loanId);
+      .where(eq(loans.id, loanId));
 
-    if (updateError) return NextResponse.json({ error: updateError.message }, { status: 500 });
+    // ── Mirror the repayment to the LendingContract ──────────────────────────
+    const onchain = await recordRepaymentOnchain({
+      db,
+      loanId,
+      loanMetadata: loan.metadata,
+      amountXlm: amount,
+    });
 
     // Record on Ledger
-    await srClient.from("ledger_transactions").insert({
-      user_id: user.id, // the borrower
+    await db.insert(ledgerTransactions).values({
+      userId: user.id, // the borrower
       category: "loan_repay",
-      amount: amount,
+      amount: String(amount),
       currency: "XLM",
       status: "confirmed",
-      ref_type: "loan_repay",
-      ref_id: repayment.id, // link to the repayment record
-      metadata: JSON.stringify({
+      refType: "loan_repay",
+      refId: repayment.id, // link to the repayment record
+      metadata: {
         txHash,
-        borrowerAddress,
+        borrowerAddress: verification.source,
+        verifiedLedger: verification.ledger,
         lenderAddress,
         lenderUserId,
+        // Full pro-rata breakdown so each lender's share of this repayment is
+        // auditable after the fact (Issue #269).
+        lenderPayouts: lenderPayouts.map((entry) => ({
+          lenderUserId: entry.lenderId,
+          address: entry.address,
+          share: +entry.share.toFixed(7),
+          payout: entry.payout,
+        })),
         loanId,
         repaymentId: repayment.id,
         principalAmount: loan.principal_amount,
         repaidSoFar: newRepaidAmount,
         repaidAt: new Date().toISOString(),
-      }),
+        // Which fee was charged and where it came from, so a borrower dispute
+        // can be settled from the ledger alone (issue #324).
+        platformFeeBps: resolvedFee.feeBps,
+        platformFeeAmount: platformFee,
+        platformFeeSource: resolvedFee.source,
+        platformFeeVersion: resolvedFee.version,
+      },
     });
 
     // Add reputation points
     const repayPoints = newStatus === "repaid" ? 20 : 5;
-    await srClient.from("reputation_events").insert({
-      user_id:      user.id,
-      source_type:  "loan_repayment",
-      source_id:    loanId,
-      points_delta: repayPoints,
-      reason:       `On-chain repayment of ${amount.toFixed(2)} XLM`,
+    await db.insert(reputationEvents).values({
+      userId: user.id,
+      sourceType: "loan_repayment",
+      sourceId: loanId,
+      pointsDelta: repayPoints,
+      reason: `On-chain repayment of ${amount.toFixed(2)} XLM`,
     });
 
     // Notifications
@@ -153,16 +260,22 @@ export async function POST(request: NextRequest) {
       type: "loan_repaid",
     });
 
-    if (lenderUserId) {
+    // Notify every lender with the slice that reached them.
+    for (const entry of lenderPayouts) {
+      if (!entry.lenderId) continue;
+
       await createNotification({
-        userId: lenderUserId,
+        userId: entry.lenderId,
         title: "Loan Repayment Received",
-        message: `The borrower has repaid ${amount.toFixed(2)} XLM towards their loan on-chain!`,
+        message:
+          lenderPayouts.length > 1
+            ? `The borrower repaid ${amount.toFixed(2)} XLM on-chain. Your share (${(entry.share * 100).toFixed(1)}% of this loan) is ${entry.payout.toFixed(2)} XLM.`
+            : `The borrower has repaid ${amount.toFixed(2)} XLM towards their loan on-chain!`,
         type: "loan_repaid",
       });
     }
 
-    return NextResponse.json({ repayment, loanStatus: newStatus, txHash }, { status: 201 });
+    return NextResponse.json({ repayment, loanStatus: newStatus, txHash, onchain }, { status: 201 });
   } catch (error) {
     if (isRedirectError(error)) throw error;
     console.error("Repayment error:", error);

@@ -9,8 +9,10 @@ import {
   Address,
   nativeToScVal,
   scValToNative,
+  StrKey,
 } from "@stellar/stellar-sdk";
-import { signTransaction } from "@stellar/freighter-api";
+import { signTransactionWithWallet } from "@/lib/stellar/wallet";
+import { redis } from "@/lib/services/redis";
 
 // ─── Network config ───────────────────────────────────────────────────────────
 
@@ -56,11 +58,41 @@ export function stringToScVal(value: string): xdr.ScVal {
   return nativeToScVal(value, { type: "string" });
 }
 
+/** Encode raw bytes (e.g. flash-loan callback params) as a Soroban Bytes ScVal. */
+export function bytesToScVal(value: Uint8Array | Buffer): xdr.ScVal {
+  return nativeToScVal(value, { type: "bytes" });
+}
+
 /**
  * Encode a unit #[contracttype] enum variant as an ScVec([ScSymbol("Variant")]).
  */
 export function enumToScVal(variant: string): xdr.ScVal {
   return xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(variant)]);
+}
+
+/**
+ * Encode a tuple-variant #[contracttype] enum (e.g. `MultiSigAdmin::AdminAction`)
+ * as `ScVec([ScSymbol(variant), field0, field1, ...])`.
+ */
+export function tupleEnumToScVal(variant: string, fields: xdr.ScVal[]): xdr.ScVal {
+  return xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(variant), ...fields]);
+}
+
+/**
+ * Encode a `#[contracttype]` struct as an ScMap. Soroban requires map keys to
+ * be sorted, so the entries are ordered by field name regardless of how the
+ * caller listed them.
+ */
+export function structToScVal(fields: Record<string, xdr.ScVal>): xdr.ScVal {
+  const entries = Object.keys(fields)
+    .sort()
+    .map((key) => new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol(key), val: fields[key] }));
+  return xdr.ScVal.scvMap(entries);
+}
+
+/** Encode a `Vec<T>` of already-encoded values. */
+export function vecToScVal(items: xdr.ScVal[]): xdr.ScVal {
+  return xdr.ScVal.scvVec(items);
 }
 
 /** Decode an ScVal returned by the contract back to a native JS value. */
@@ -85,7 +117,7 @@ export interface CallContractOptions {
  */
 async function sorobanRpc<T = Record<string, unknown>>(
   method: string,
-  params: Record<string, unknown>
+  params: Record<string, unknown>,
 ): Promise<T> {
   const res = await fetch(SOROBAN_RPC_URL, {
     method: "POST",
@@ -93,11 +125,15 @@ async function sorobanRpc<T = Record<string, unknown>>(
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
   if (!res.ok) {
-    throw new Error(`Soroban RPC transport error (${method}): ${res.statusText}`);
+    throw new Error(
+      `Soroban RPC transport error (${method}): ${res.statusText}`,
+    );
   }
   const json = (await res.json()) as { result?: T; error?: unknown };
   if (json.error) {
-    throw new Error(`Soroban RPC error (${method}): ${JSON.stringify(json.error)}`);
+    throw new Error(
+      `Soroban RPC error (${method}): ${JSON.stringify(json.error)}`,
+    );
   }
   return json.result as T;
 }
@@ -105,15 +141,24 @@ async function sorobanRpc<T = Record<string, unknown>>(
 /**
  * Fetch account sequence number from Horizon REST API.
  * Soroban RPC has no getAccount method — account data lives on Horizon.
+ *
+ * The address is validated as an Ed25519 public key (G...) before it is
+ * interpolated into the request URL, so a malformed or malicious value can
+ * never alter the request path.
  */
-async function getAccountSequence(address: string): Promise<string> {
-  const res = await fetch(`${HORIZON_URL}/accounts/${address}`);
+export async function getAccountSequence(address: string): Promise<string> {
+  if (typeof address !== "string" || !StrKey.isValidEd25519PublicKey(address)) {
+    throw new Error(
+      "Invalid Stellar account address: expected a 56-character Ed25519 public key starting with 'G'.",
+    );
+  }
+  const res = await fetch(`${HORIZON_URL}/accounts/${encodeURIComponent(address)}`);
   if (!res.ok) {
     if (res.status === 404) {
       throw new Error(
         `Account ${address} not found on Stellar network. ` +
-        `Make sure this wallet has been funded with at least 1 XLM on testnet ` +
-        `(visit https://friendbot.stellar.org?addr=${address}).`
+          `Make sure this wallet has been funded with at least 1 XLM on testnet ` +
+          `(visit https://friendbot.stellar.org?addr=${address}).`,
       );
     }
     throw new Error(`Horizon account fetch failed: ${res.statusText}`);
@@ -124,17 +169,32 @@ async function getAccountSequence(address: string): Promise<string> {
 
 // ─── Write: build → simulate → assemble → sign → submit → poll ───────────────
 
+export interface InvokeContractResult {
+  /** Decoded contract return value, or `null` for void functions. */
+  returnValue: unknown;
+  /** Hash of the submitted transaction — send it to the API for verification. */
+  hash: string;
+}
+
 /**
  * Full transaction flow without any SDK RPC calls.
  * Returns the decoded contract return value, or `null` for void functions.
  */
-export async function callContract({
+export async function callContract(options: CallContractOptions): Promise<unknown> {
+  const { returnValue } = await invokeContract(options);
+  return returnValue;
+}
+
+/**
+ * Like `callContract` but also returns the transaction hash, which the API
+ * routes verify against Soroban RPC before trusting the call happened.
+ */
+export async function invokeContract({
   contractId,
   method,
   args,
   callerAddress,
-}: CallContractOptions): Promise<unknown> {
-
+}: CallContractOptions): Promise<InvokeContractResult> {
   // ── 1. Fetch account sequence from Horizon REST API ──────────────────────
   // (Soroban RPC has no getAccount — account data lives on Horizon)
   const originalSequence = await getAccountSequence(callerAddress);
@@ -153,8 +213,8 @@ export async function callContract({
   // ── 3. Simulate via raw RPC ────────────────────────────────────────────────
   const simData = await sorobanRpc<{
     error?: string;
-    transactionData: string;           // base64 SorobanTransactionData XDR
-    minResourceFee: string;            // stroops to add on top of base fee
+    transactionData: string; // base64 SorobanTransactionData XDR
+    minResourceFee: string; // stroops to add on top of base fee
     results: Array<{ auth: string[]; xdr: string }>;
     latestLedger: number;
   }>("simulateTransaction", { transaction: simTx.toXDR() });
@@ -163,16 +223,20 @@ export async function callContract({
     throw new Error(`Soroban simulation failed: ${simData.error}`);
   }
   if (!simData.results?.length || !simData.transactionData) {
-    throw new Error("Simulation returned no results — contract may not exist on this network.");
+    throw new Error(
+      "Simulation returned no results — contract may not exist on this network.",
+    );
   }
 
   // ── 4. Assemble: build a FRESH tx with simulation results ─────────────────
-  const authEntries = (simData.results[0]?.auth ?? []).map(
-    (a: string) => xdr.SorobanAuthorizationEntry.fromXDR(a, "base64")
+  const authEntries = (simData.results[0]?.auth ?? []).map((a: string) =>
+    xdr.SorobanAuthorizationEntry.fromXDR(a, "base64"),
   );
 
   // Fee = base fee + simulation's minResourceFee
-  const assembledFee = String(Number(BASE_FEE) + Number(simData.minResourceFee));
+  const assembledFee = String(
+    Number(BASE_FEE) + Number(simData.minResourceFee),
+  );
 
   // Extract the HostFunction from the first operation of our sim tx
   // tx.operations returns decoded JS objects; func is the raw xdr.HostFunction
@@ -196,33 +260,29 @@ export async function callContract({
       Operation.invokeHostFunction({
         func: originalOp.func,
         auth: authEntries,
-      })
+      }),
     )
     .setTimeout(30)
     .build();
 
-  // ── 5. Sign with Freighter ─────────────────────────────────────────────────
-  // signTransaction returns { signedTxXdr, signerAddress, error? }
-  const freighterResult = await signTransaction(assembledTx.toXDR(), {
+  // ── 5. Sign with selected wallet ───────────────────────────────────────────
+  const signedResult = await signTransactionWithWallet({
+    xdr: assembledTx.toXDR(),
     networkPassphrase: NETWORK_PASSPHRASE,
     address: callerAddress,
   });
-  if (freighterResult.error) {
-    throw new Error(`Freighter signing failed: ${JSON.stringify(freighterResult.error)}`);
-  }
-  if (!freighterResult.signedTxXdr) {
-    throw new Error("Freighter returned no signed XDR — user may have cancelled.");
-  }
 
   // ── 6. Submit via raw RPC ──────────────────────────────────────────────────
   const sendData = await sorobanRpc<{
     status: string;
     hash: string;
     errorResult?: unknown;
-  }>("sendTransaction", { transaction: freighterResult.signedTxXdr });
+  }>("sendTransaction", { transaction: signedResult.signedTxXdr });
 
   if (sendData.status === "ERROR") {
-    throw new Error(`Transaction submission failed: ${JSON.stringify(sendData.errorResult)}`);
+    throw new Error(
+      `Transaction submission failed: ${JSON.stringify(sendData.errorResult)}`,
+    );
   }
 
   // ── 7. Poll for finality via raw RPC ──────────────────────────────────────
@@ -231,13 +291,19 @@ export async function callContract({
     await sleep(1000);
     const txResult = await sorobanRpc<{
       status: string;
-      returnValue?: string;  // base64 XDR SCVal when SUCCESS
+      returnValue?: string; // base64 XDR SCVal when SUCCESS
     }>("getTransaction", { hash });
 
     if (txResult.status === "SUCCESS") {
-      return txResult.returnValue
-        ? decodeScVal(xdr.ScVal.fromXDR(txResult.returnValue, "base64"))
-        : null;
+      // Invalidate the cache for this contract since its state has changed
+      await invalidateContractCache(contractId).catch(() => {});
+
+      return {
+        hash,
+        returnValue: txResult.returnValue
+          ? decodeScVal(xdr.ScVal.fromXDR(txResult.returnValue, "base64"))
+          : null,
+      };
     }
     if (txResult.status === "FAILED") {
       throw new Error(`Transaction failed on-chain: hash=${hash}`);
@@ -260,6 +326,19 @@ export async function simulateContractCall({
   args,
   callerAddress,
 }: CallContractOptions): Promise<unknown> {
+  const cacheKey = `soroban-cache:${contractId}:${method}:${args.map((a) => a.toXDR("base64")).join(",")}`;
+
+  if (redis) {
+    try {
+      const cached = await redis.get<string>(cacheKey);
+      if (cached !== null && cached !== undefined) {
+        return parseValue(typeof cached === "string" ? cached : JSON.stringify(cached));
+      }
+    } catch (err) {
+      console.error("[Redis] Cache read failed:", err);
+    }
+  }
+
   // Get account sequence from Horizon REST API
   const sequence = await getAccountSequence(callerAddress);
   const account = new Account(callerAddress, sequence);
@@ -285,12 +364,45 @@ export async function simulateContractCall({
 
   // results[0].xdr is the base64-encoded SCVal return value
   const retvalXdr = simData.results?.[0]?.xdr;
-  return retvalXdr
-    ? decodeScVal(xdr.ScVal.fromXDR(retvalXdr, "base64"))
-    : null;
+  const result = retvalXdr ? decodeScVal(xdr.ScVal.fromXDR(retvalXdr, "base64")) : null;
+
+  if (redis && result !== null && result !== undefined) {
+    try {
+      await redis.set(cacheKey, stringifyValue(result), { ex: 180 });
+    } catch (err) {
+      console.error("[Redis] Cache write failed:", err);
+    }
+  }
+
+  return result;
 }
 
 // ─── Internal ─────────────────────────────────────────────────────────────────
 
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function stringifyValue(value: unknown): string {
+  return JSON.stringify(value, (_key, val) =>
+    typeof val === "bigint" ? { __bigint: val.toString() } : val
+  );
+}
+
+function parseValue(jsonStr: string): unknown {
+  return JSON.parse(jsonStr, (_key, val) =>
+    val && typeof val === "object" && "__bigint" in val ? BigInt(val.__bigint) : val
+  );
+}
+
+export async function invalidateContractCache(contractId: string): Promise<void> {
+  if (!redis) return;
+  try {
+    const keys = await redis.keys(`soroban-cache:${contractId}:*`);
+    if (keys.length > 0) {
+      await redis.del(...keys);
+      console.log(`[Redis] Invalidated ${keys.length} cache keys for contract ${contractId}`);
+    }
+  } catch (error) {
+    console.error("[Redis] Cache invalidation failed:", error);
+  }
+}

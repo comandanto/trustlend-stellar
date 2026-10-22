@@ -1,5 +1,6 @@
 import { Suspense } from "react";
 import { AuthPageClient } from "@/components/auth/AuthPageClient";
+import { ReferralCodeStash } from "@/components/auth/ReferralCodeStash";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
@@ -10,6 +11,8 @@ export const metadata: Metadata = {
 export default function AuthPage() {
   return (
     <Suspense fallback={<AuthPageSkeleton />}>
+      {/* Remembers an invite code across the wallet sign-in round trip. */}
+      <ReferralCodeStash />
       <AuthPageClient />
     </Suspense>
   );
@@ -17,8 +20,8 @@ export default function AuthPage() {
 
 function AuthPageSkeleton() {
   return (
-    <main className="auth-page-shell">
-      <div className="auth-page-card auth-page-card--loading" aria-busy="true" aria-label="Loading authentication" />
+    <main className="grid min-h-screen place-items-center bg-bg" aria-busy="true" aria-label="Loading authentication">
+      <div className="h-8 w-8 animate-spin rounded-full border-2 border-border border-t-primary" />
     </main>
   );
 }

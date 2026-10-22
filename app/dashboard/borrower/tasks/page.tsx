@@ -3,33 +3,30 @@ import { TasksBoard } from "@/components/dashboard/TasksBoard";
 import { requireAuthenticatedUser } from "@/lib/auth/session";
 import { getBorrowerDashboardMetrics, presentBorrowerMetrics } from "@/lib/dashboard/metrics";
 import { borrowerNavLinks } from "@/lib/dashboard/borrower-links";
-import { getServerSupabaseClient } from "@/lib/supabase/server";
+import { and, eq } from "drizzle-orm";
+import { getDb } from "@/lib/db/client";
+import { getProfile } from "@/lib/db/queries";
+import { reputationEvents } from "@/lib/db/schema";
 import { getPlatformTasks } from "@/app/api/tasks/complete/route";
 
 export default async function BorrowerTasksPage() {
   const { user } = await requireAuthenticatedUser("borrower");
   const metrics = await getBorrowerDashboardMetrics(user.id);
-  const supabase = await getServerSupabaseClient();
+  const db = getDb();
 
-  const [profileRes, completedEventsRes] = supabase
-    ? await Promise.all([
-        supabase
-          .from("profiles")
-          .select("full_name")
-          .eq("id", user.id)
-          .maybeSingle(),
-        // Which tasks has this user already completed?
-        supabase
-          .from("reputation_events")
-          .select("source_key, source_id")
-          .eq("user_id", user.id)
-          .eq("source_type", "task_completion"),
-      ])
-    : [{ data: null }, { data: [] }];
+  const [profile, completedEvents] = await Promise.all([
+    getProfile(db, user.id),
+    // Which tasks has this user already completed?
+    db
+      ? db
+          .select({ source_key: reputationEvents.sourceKey, source_id: reputationEvents.sourceId })
+          .from(reputationEvents)
+          .where(and(eq(reputationEvents.userId, user.id), eq(reputationEvents.sourceType, "task_completion")))
+      : Promise.resolve([]),
+  ]);
 
-  const profile          = profileRes.data;
   const completedTaskIds = new Set(
-    (completedEventsRes.data ?? []).map((e) => String(e.source_key ?? e.source_id ?? ""))
+    completedEvents.map((e) => String(e.source_key ?? e.source_id ?? ""))
   );
   const currentScore     = metrics.reputationScore;
 
@@ -46,7 +43,7 @@ export default async function BorrowerTasksPage() {
       heading="Trust Tasks"
       description="Complete these tasks to build your trust score. Higher score = better loan terms and higher limits."
       email={user.email ?? null}
-      userName={String(user.user_metadata?.full_name ?? profile?.full_name ?? "")}
+      userName={String(user.fullName ?? profile?.full_name ?? "")}
       metrics={presentBorrowerMetrics(metrics)}
       currentPath="/dashboard/borrower/tasks"
       links={borrowerNavLinks}
@@ -55,7 +52,7 @@ export default async function BorrowerTasksPage() {
         {/* How the score works */}
         <article
           className="workspace-card workspace-card--full"
-          style={{ background: "rgba(126,47,208,0.05)", border: "1px solid rgba(126,47,208,0.15)" }}
+          style={{ background: "color-mix(in srgb, var(--primary) 5%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 15%, transparent)" }}
         >
           <h2 className="workspace-card-title">How Your Trust Score Works</h2>
           <div
@@ -77,13 +74,13 @@ export default async function BorrowerTasksPage() {
                 style={{
                   display: "flex", gap: "0.65rem", alignItems: "flex-start",
                   padding: "0.75rem", borderRadius: "0.6rem",
-                  background: "rgba(255,255,255,0.03)",
+                  background: "color-mix(in srgb, var(--fg) 3%, transparent)",
                 }}
               >
                 <span style={{ fontSize: "1.4rem" }}>{row.icon}</span>
                 <div>
                   <p style={{ fontWeight: 600, fontSize: "0.86rem", marginBottom: "0.2rem" }}>{row.event}</p>
-                  <p style={{ fontSize: "0.82rem", color: "#22cf9d", fontWeight: 700 }}>{row.pts} pts</p>
+                  <p style={{ fontSize: "0.82rem", color: "var(--accent)", fontWeight: 700 }}>{row.pts} pts</p>
                   <p style={{ fontSize: "0.75rem", opacity: 0.5 }}>{row.note}</p>
                 </div>
               </div>

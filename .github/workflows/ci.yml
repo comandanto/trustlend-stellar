@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ "main", "dev" ]
 
+permissions:
+  contents: read
+
 jobs:
   test-smart-contracts:
     name: Test Soroban Contracts
@@ -35,6 +38,9 @@ jobs:
   build-frontend:
     name: Build Next.js Application
     runs-on: ubuntu-latest
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -54,12 +60,30 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Unit tests
+        run: npm test
+
       - name: Build Next.js
-        # We set this environment variable because dummy keys are needed for the build if relying on env
+        # Placeholder env so the build never needs real secrets.
         env:
-          NEXT_PUBLIC_SUPABASE_URL: "https://example.supabase.co"
-          NEXT_PUBLIC_SUPABASE_ANON_KEY: "dummy-key"
           NEXT_PUBLIC_STELLAR_NETWORK: "testnet"
           NEXT_PUBLIC_STELLAR_HORIZON_URL: "https://horizon-testnet.stellar.org"
           NEXT_PUBLIC_ADMIN_ADDRESS: "GAJRNUO6HSMQG4FNHNWQVRXJZJZ7QRA7HXPYYB6H5PTA3EAAJXJNZD7U"
         run: npm run build
+
+      # Apply pending Drizzle migrations to the production database before the
+      # deploy goes live. No-op until the DATABASE_URL secret exists.
+      - name: Migrate database
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && env.DATABASE_URL != '' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: npm run db:migrate
+
+      - name: Deploy to Vercel
+        if: ${{ env.VERCEL_TOKEN != '' }}
+        run: npx vercel --prod --yes --token=${{ env.VERCEL_TOKEN }}
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
