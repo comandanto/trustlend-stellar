@@ -32,8 +32,8 @@
   },
   "dependencies": {
     "@creit.tech/stellar-wallets-kit": "^2.5.0",
-    "@neondatabase/serverless": "^1.1.0",
-    "@radix-ui/react-tooltip": "^1.2.16",
+    "@neondatabase/serverless": "^1.2.0",
+    "@radix-ui/react-tooltip": "^1.4.1",
     "@stellar/freighter-api": "^6.0.1",
     "@stellar/stellar-sdk": "^16.0.1",
     "@upstash/ratelimit": "^2.0.8",
@@ -72,7 +72,7 @@
     "eslint-config-next": "16.4.2",
     "husky": "^9.1.7",
     "pg": "^8.23.0",
-    "tailwindcss": "^4",
+    "tailwindcss": "^4.3.3",
     "tsx": "^4.19.2",
     "typescript": "^5",
     "vitest": "^4.1.12"
